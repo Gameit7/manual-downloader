@@ -830,63 +830,73 @@ def fetch_torrent_file(torrent_source: str) -> tuple:
 
     return download_dir, torrent_file_path, raw_payload
 
+def _bdecode(data: bytes, idx: int = 0):
+    """Minimal bencoding decoder for .torrent files."""
+    if data[idx:idx+1] == b'i':
+        end = data.index(b'e', idx)
+        return int(data[idx+1:end]), end + 1
+    elif data[idx:idx+1] == b'l':
+        lst = []
+        idx += 1
+        while data[idx:idx+1] != b'e':
+            val, idx = _bdecode(data, idx)
+            lst.append(val)
+        return lst, idx + 1
+    elif data[idx:idx+1] == b'd':
+        dct = {}
+        idx += 1
+        while data[idx:idx+1] != b'e':
+            key, idx = _bdecode(data, idx)
+            val, idx = _bdecode(data, idx)
+            if isinstance(key, bytes):
+                key = key.decode('utf-8', errors='replace')
+            dct[key] = val
+        return dct, idx + 1
+    elif data[idx:idx+1].isdigit():
+        colon = data.index(b':', idx)
+        length = int(data[idx:colon])
+        start = colon + 1
+        return data[start:start+length], start + length
+    else:
+        raise ValueError(f"Invalid bencoding at position {idx}: {data[idx:idx+10]}")
+
 def list_torrent_files(torrent_file_path: str) -> list:
-    """Use aria2c --show-files to list all files in a torrent with their indices.
+    """Parse .torrent file directly to extract file list with indices.
+    Returns list of dicts: [{index: int, path: str, filename: str}, ...]
+    Index is 1-based to match aria2c --select-file numbering."""
+    with open(torrent_file_path, "rb") as f:
+        raw = f.read()
     
-    aria2c --show-files output format:
-        idx|path/length
-        ===+==============
-        1|path/to/file.mkv
-         |320.5MiB
-        ---+--------------
-        2|path/to/file2.mkv
-         |315.2MiB
-        ---+--------------
+    meta, _ = _bdecode(raw)
+    info = meta.get("info", {})
     
-    Returns list of dicts: [{index: int, path: str, filename: str, size_str: str}, ...]
-    """
-    cmd = ["aria2c", "--show-files", torrent_file_path]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if proc.returncode != 0:
-        raise RuntimeError(f"aria2c --show-files failed: {proc.stderr}")
-
     files = []
-    current_idx = None
-    current_path = None
-
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("===") or line.startswith("---") or line.startswith("idx"):
-            continue
-        
-        # Line with index: "1|path/to/file.mkv"
-        idx_match = re.match(r'^(\d+)\|(.+)$', line)
-        if idx_match:
-            current_idx = int(idx_match.group(1))
-            current_path = idx_match.group(2).strip()
-            continue
-        
-        # Size line: " |320.5MiB" or "|320.5MiB"
-        size_match = re.match(r'^\|?(.+)$', line)
-        if size_match and current_idx is not None and current_path:
-            fname = os.path.basename(current_path)
+    if "files" in info:
+        # Multi-file torrent
+        for i, file_entry in enumerate(info["files"]):
+            path_parts = file_entry.get("path", [])
+            # path_parts is list of bytes
+            path_str = "/".join(
+                p.decode('utf-8', errors='replace') if isinstance(p, bytes) else str(p)
+                for p in path_parts
+            )
+            fname = os.path.basename(path_str)
             files.append({
-                "index": current_idx,
-                "path": current_path,
+                "index": i + 1,  # aria2c uses 1-based indexing
+                "path": path_str,
                 "filename": fname,
             })
-            current_idx = None
-            current_path = None
-
-    # Handle last entry if no trailing separator
-    if current_idx is not None and current_path:
-        fname = os.path.basename(current_path)
+    else:
+        # Single-file torrent
+        name = info.get("name", b"unknown")
+        if isinstance(name, bytes):
+            name = name.decode('utf-8', errors='replace')
         files.append({
-            "index": current_idx,
-            "path": current_path,
-            "filename": fname,
+            "index": 1,
+            "path": name,
+            "filename": name,
         })
-
+    
     return files
 
 def download_selected_files(torrent_file_path: str, download_dir: str, file_indices: list) -> list:
@@ -1557,6 +1567,10 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
         if ep_to_file_idx:
             mapped_eps = sorted(ep_to_file_idx.keys())
             log_message(f"   Range: {mapped_eps[0]}-{mapped_eps[-1]}")
+            # Show first 5 mappings for verification
+            for ep in mapped_eps[:5]:
+                tf = ep_to_file_idx[ep]
+                log_message(f"   Ep {ep} → file index {tf['index']}: {tf['filename'][:60]}")
         log_message("")
 
         # Filter episodes to only those available
