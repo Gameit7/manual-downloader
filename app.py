@@ -233,17 +233,56 @@ def is_blacklisted_platform(title: str) -> bool:
     return bool(re.search(r'\b(nf|netflix|iq|iqiyi)\b', title.lower()))
 
 def get_audio_score(title: str) -> int:
+    """
+    Score hierarchy:
+      4: Multi-Audio (e.g. MULTi-Audio / MULTi AAC)
+      3: Dual-Audio (e.g. DUAL / Dual-Audio / DUAL AAC)
+      2: Explicit Japanese Audio (e.g. (JA), (JP), Japanese Dub, Japanese Audio, WEB-DLJPN)
+      1: Default / Standard Japanese (clean anime release with no foreign audio tags)
+     -5: Foreign Single Audio Only (e.g. (KA), Korean Audio, (ZH), Chinese Dub, standalone English Dub)
+    """
     if not title or not isinstance(title, str):
         return 0
     t_lower = title.lower()
+
+    # 1. Multi-Audio (highest priority)
     if re.search(r'\bmulti[- ]audio\b|multiaudio|\bmulti\s+aac\b', t_lower):
+        return 4
+
+    # 2. Dual-Audio
+    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\s+aac\b|\bdual\b', t_lower):
+        return 3
+
+    # 3. Check for Explicit Foreign Audio Only (Korean, Chinese, English dub, etc. without Dual/Multi)
+    is_foreign = bool(re.search(
+        r'[\(\[]\s*(ka|ko|kor|zh|cn|chi)\s*[\)\]]|'
+        r'\b(korean|kor)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(chinese|mandarin)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(english|eng)\s*[-_ ]*dub\b|'
+        r'web-dl\s*(kor|chi)',
+        t_lower
+    ))
+
+    # 4. Explicit Japanese Audio
+    is_japanese = bool(re.search(
+        r'[\(\[]\s*(ja|jp|jpn)\s*[\)\]]|'
+        r'\b(japanese|jpn|jap)\s*[-_ ]*(audio|dub)\b|'
+        r'web-dl\s*jpn',
+        t_lower
+    ))
+
+    if is_foreign and not is_japanese:
+        return -5
+
+    if is_japanese:
         return 2
-    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\b', t_lower):
-        return 1
-    return 0
+
+    # 5. Default Japanese (standard anime release)
+    return 1
 
 def is_multi_audio_torrent(title: str) -> bool:
-    return get_audio_score(title) > 0
+    return get_audio_score(title) >= 3
+
 
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
@@ -377,7 +416,28 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             words = get_clean_words(clean_t)
             if not words:
                 return False
-            matching_words = [w for w in words if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower)]
+
+            matching_words = set()
+            for w in words:
+                if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower):
+                    matching_words.add(w)
+
+            # Check adjacent merged words (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+            for i in range(len(words) - 1):
+                w1, w2 = words[i], words[i+1]
+                if len(w1) >= 2 and len(w2) >= 2:
+                    pair = w1 + w2
+                    if re.search(rf'\b{re.escape(pair)}\b', torrent_title_lower):
+                        matching_words.add(w1)
+                        matching_words.add(w2)
+
+            # Check if entire title with no spaces matches
+            if len(words) >= 2:
+                all_merged = "".join(words)
+                if re.search(rf'\b{re.escape(all_merged)}\b', torrent_title_lower):
+                    for w in words:
+                        matching_words.add(w)
+
             ratio = len(matching_words) / len(words)
             if len(words) <= 2:
                 return len(matching_words) == len(words)
@@ -478,6 +538,12 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         search_bases.append(r_super)
     if e_super and e_super not in search_bases:
         search_bases.append(e_super)
+
+    # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+    if len(r_base.split()) >= 2:
+        r_collapsed = "".join(r_base.split())
+        if len(r_collapsed) >= 3 and r_collapsed not in search_bases:
+            search_bases.append(r_collapsed)
     COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
     for title_base in [r_base] + synonyms:
         if not title_base:
@@ -552,6 +618,20 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
             if var_merged_o != var_merged:
                 queries.append(f'{var_merged_o} "{ep_str}"')
                 queries.append(f'{var_merged_o} {ep_str}')
+
+    # Fallback targeted group queries (Erai-raws & ToonsHub) to rescue older episodes buried past Nyaa RSS 75-item limits
+    for base in search_bases:
+        if not base:
+            continue
+        if base in (r_base, e_base) or (erai_title and base == clean_and_strip(erai_title)):
+            queries.append(f'[Erai-raws] {base} "{ep_str}"')
+            queries.append(f'[ToonsHub] {base} "{ep_str}"')
+            words = base.split()
+            if len(words) > 3:
+                short = " ".join(words[:3])
+                queries.append(f'[Erai-raws] {short} "{ep_str}"')
+                queries.append(f'[ToonsHub] {short} "{ep_str}"')
+
     return list(dict.fromkeys(queries))
 
 # ─── Torrent Hash Extraction ──────────────────────────────────
@@ -1335,7 +1415,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     winner = good[0]
     torrent_title = winner["title"]
     audio_score = get_audio_score(torrent_title)
-    is_multi_audio = 1 if audio_score >= 1 else 0
+    is_multi_audio = 1 if audio_score >= 3 else 0
 
     log_message(f"📦 Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio: {audio_score})")
 
@@ -1374,10 +1454,14 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 audio_tracks_1080 = ?,
                 uploaded_at = ?,
                 last_checked = ?,
+                mirror_720_missing = 1,
+                mirror_480_missing = 1,
+                mirror_updated_at = ?,
                 pending_review_until = 0
             WHERE id = ?
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
+              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+              int(time.time()), ep_id])
 
         # Store parsed erai_title
         parsed_erai = parse_erai_anime_title(v_name)
@@ -1471,7 +1555,7 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
         log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}]")
 
         audio_score = get_audio_score(v_name)
-        is_multi_audio = 1 if audio_score >= 1 else 0
+        is_multi_audio = 1 if audio_score >= 3 else 0
 
         upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
         pd_id = upload["id"]
@@ -1495,10 +1579,14 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
                 audio_tracks_1080 = ?,
                 uploaded_at = ?,
                 last_checked = ?,
+                mirror_720_missing = 1,
+                mirror_480_missing = 1,
+                mirror_updated_at = ?,
                 pending_review_until = 0
             WHERE id = ?
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
+              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+              int(time.time()), ep_id])
 
         # Store parsed erai_title
         parsed_erai = parse_erai_anime_title(v_name)
@@ -1702,7 +1790,7 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                     log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}]")
 
                     audio_score = get_audio_score(fname)
-                    is_multi_audio = 1 if audio_score >= 1 else 0
+                    is_multi_audio = 1 if audio_score >= 3 else 0
 
                     upload = await asyncio.to_thread(upload_pixeldrain, fp, fname)
                     pd_id = upload["id"]
@@ -1726,10 +1814,14 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                             audio_tracks_1080 = ?,
                             uploaded_at = ?,
                             last_checked = ?,
+                            mirror_720_missing = 1,
+                            mirror_480_missing = 1,
+                            mirror_updated_at = ?,
                             pending_review_until = 0
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-                          subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
+                          subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+                          int(time.time()), ep_id])
 
                     # Store parsed erai_title
                     parsed_erai = parse_erai_anime_title(fname)
