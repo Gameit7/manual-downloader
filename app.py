@@ -21,7 +21,7 @@ TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
 
 GAS_PROXIES = []
-for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3"]:
+for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3", "GAS_PROXY_URL_4"]:
     _v = os.environ.get(_k, "").strip()
     if _v and _v not in GAS_PROXIES:
         GAS_PROXIES.append(_v)
