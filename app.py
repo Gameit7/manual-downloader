@@ -798,7 +798,19 @@ def fetch_torrent_file(torrent_source: str) -> tuple:
 
 def list_torrent_files(torrent_file_path: str) -> list:
     """Use aria2c --show-files to list all files in a torrent with their indices.
-    Returns list of dicts: [{index: int, path: str, filename: str, size: int}, ...]"""
+    
+    aria2c --show-files output format:
+        idx|path/length
+        ===+==============
+        1|path/to/file.mkv
+         |320.5MiB
+        ---+--------------
+        2|path/to/file2.mkv
+         |315.2MiB
+        ---+--------------
+    
+    Returns list of dicts: [{index: int, path: str, filename: str, size_str: str}, ...]
+    """
     cmd = ["aria2c", "--show-files", torrent_file_path]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if proc.returncode != 0:
@@ -807,29 +819,39 @@ def list_torrent_files(torrent_file_path: str) -> list:
     files = []
     current_idx = None
     current_path = None
-    current_size = None
 
     for line in proc.stdout.splitlines():
         line = line.strip()
-        idx_match = re.match(r'^(\d+)\|', line)
+        if not line or line.startswith("===") or line.startswith("---") or line.startswith("idx"):
+            continue
+        
+        # Line with index: "1|path/to/file.mkv"
+        idx_match = re.match(r'^(\d+)\|(.+)$', line)
         if idx_match:
-            # Save previous entry
-            if current_idx is not None and current_path:
-                fname = os.path.basename(current_path)
-                files.append({"index": current_idx, "path": current_path, "filename": fname, "size": current_size or 0})
             current_idx = int(idx_match.group(1))
-            # Parse rest: "path/to/file|SIZE_BYTES|..."
-            parts = line.split("|")
-            current_path = parts[1] if len(parts) > 1 else ""
-            try:
-                current_size = int(parts[2]) if len(parts) > 2 else 0
-            except (ValueError, IndexError):
-                current_size = 0
+            current_path = idx_match.group(2).strip()
+            continue
+        
+        # Size line: " |320.5MiB" or "|320.5MiB"
+        size_match = re.match(r'^\|?(.+)$', line)
+        if size_match and current_idx is not None and current_path:
+            fname = os.path.basename(current_path)
+            files.append({
+                "index": current_idx,
+                "path": current_path,
+                "filename": fname,
+            })
+            current_idx = None
+            current_path = None
 
-    # Save last entry
+    # Handle last entry if no trailing separator
     if current_idx is not None and current_path:
         fname = os.path.basename(current_path)
-        files.append({"index": current_idx, "path": current_path, "filename": fname, "size": current_size or 0})
+        files.append({
+            "index": current_idx,
+            "path": current_path,
+            "filename": fname,
+        })
 
     return files
 
