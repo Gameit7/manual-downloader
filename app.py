@@ -36,7 +36,7 @@ def get_ordered_proxies() -> list:
     _proxy_idx += 1
     return [GAS_PROXIES[(start + i) % n] for i in range(n)]
 
-TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "300"))
+TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "7200"))
 MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "7"))
 
 NYAA_TRACKERS = [
@@ -405,32 +405,33 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
 
     clean_matched_words = get_clean_words(romaji)
     is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower)) and len(clean_matched_words) >= 2
-    if not is_trusted_group:
-        torrent_clean = clean_title(torrent_title)
-        torrent_words = get_clean_words(torrent_clean)
-        anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
-        for syn in valid_synonyms:
-            if syn:
-                anime_words.update(get_clean_words(syn))
-        extra_words = []
-        concat_parts = set()
-        for i in range(len(torrent_words) - 1):
-            pair_word = torrent_words[i] + torrent_words[i+1]
-            if pair_word in anime_words:
-                concat_parts.add(torrent_words[i])
-                concat_parts.add(torrent_words[i+1])
-        for w in torrent_words:
-            if w in anime_words or w in concat_parts:
-                continue
-            is_concat = False
-            for w1 in anime_words:
-                if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
-                    is_concat = True
-                    break
-            if not is_concat:
-                extra_words.append(w)
-        if extra_words:
-            return False
+
+    torrent_clean = clean_title(torrent_title)
+    torrent_words = get_clean_words(torrent_clean)
+    anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
+    for syn in valid_synonyms:
+        if syn:
+            anime_words.update(get_clean_words(syn))
+    extra_words = []
+    concat_parts = set()
+    for i in range(len(torrent_words) - 1):
+        pair_word = torrent_words[i] + torrent_words[i+1]
+        if pair_word in anime_words:
+            concat_parts.add(torrent_words[i])
+            concat_parts.add(torrent_words[i+1])
+    for w in torrent_words:
+        if w in anime_words or w in concat_parts:
+            continue
+        is_concat = False
+        for w1 in anime_words:
+            if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
+                is_concat = True
+                break
+        if not is_concat:
+            extra_words.append(w)
+    max_extra = 2 if is_trusted_group else 0
+    if len(extra_words) > max_extra:
+        return False
 
     is_multi_sub = bool(re.search(
         r'\b(multi|m)\s*[-_:]?\s*subs?\b|'
@@ -764,6 +765,146 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     info_hash = extract_info_hash(raw_payload) if raw_payload else None
     return download_dir, best_file[0], best_file[1], best_file[2], info_hash
 
+def fetch_torrent_file(torrent_source: str) -> tuple:
+    """Download just the .torrent metadata file. Returns (download_dir, torrent_file_path, raw_payload)."""
+    download_dir = tempfile.mkdtemp(prefix="anime_batch_")
+    torrent_file_path = os.path.join(download_dir, "download.torrent")
+    raw_payload = None
+
+    if torrent_source.startswith("http"):
+        sync_transport = httpx.HTTPTransport(retries=2)
+        for proxy_base in get_ordered_proxies():
+            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
+            try:
+                with httpx.Client(transport=sync_transport, timeout=30.0) as client:
+                    r = client.get(gas_url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("status") == 200 and data.get("data"):
+                            raw_bytes = base64.b64decode(data["data"])
+                            if is_valid_torrent_data(raw_bytes):
+                                with open(torrent_file_path, "wb") as f:
+                                    f.write(raw_bytes)
+                                raw_payload = raw_bytes
+                                break
+            except Exception:
+                continue
+
+    if not raw_payload:
+        shutil.rmtree(download_dir, ignore_errors=True)
+        raise RuntimeError("Failed to fetch .torrent file from any proxy")
+
+    return download_dir, torrent_file_path, raw_payload
+
+def list_torrent_files(torrent_file_path: str) -> list:
+    """Use aria2c --show-files to list all files in a torrent with their indices.
+    Returns list of dicts: [{index: int, path: str, filename: str, size: int}, ...]"""
+    cmd = ["aria2c", "--show-files", torrent_file_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(f"aria2c --show-files failed: {proc.stderr}")
+
+    files = []
+    current_idx = None
+    current_path = None
+    current_size = None
+
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        idx_match = re.match(r'^(\d+)\|', line)
+        if idx_match:
+            # Save previous entry
+            if current_idx is not None and current_path:
+                fname = os.path.basename(current_path)
+                files.append({"index": current_idx, "path": current_path, "filename": fname, "size": current_size or 0})
+            current_idx = int(idx_match.group(1))
+            # Parse rest: "path/to/file|SIZE_BYTES|..."
+            parts = line.split("|")
+            current_path = parts[1] if len(parts) > 1 else ""
+            try:
+                current_size = int(parts[2]) if len(parts) > 2 else 0
+            except (ValueError, IndexError):
+                current_size = 0
+
+    # Save last entry
+    if current_idx is not None and current_path:
+        fname = os.path.basename(current_path)
+        files.append({"index": current_idx, "path": current_path, "filename": fname, "size": current_size or 0})
+
+    return files
+
+def download_selected_files(torrent_file_path: str, download_dir: str, file_indices: list) -> list:
+    """Download only specific file indices from a torrent. Returns list of (full_path, filename, file_size)."""
+    indices_str = ",".join(str(i) for i in file_indices)
+    trackers_arg = ",".join(NYAA_TRACKERS)
+    cmd = [
+        "aria2c", torrent_file_path,
+        f"--dir={download_dir}",
+        f"--select-file={indices_str}",
+        "--seed-time=0",
+        "--bt-stop-timeout=300",
+        "--file-allocation=none",
+        "--enable-dht=true",
+        "--enable-peer-exchange=true",
+        "--bt-enable-lpd=true",
+        "--bt-max-peers=100",
+        f"--bt-tracker={trackers_arg}",
+        "--max-connection-per-server=16",
+        "--summary-interval=15",
+        "--allow-overwrite=true",
+    ]
+
+    log_message(f"Downloading files {indices_str} (timeout={TORRENT_DOWNLOAD_TIMEOUT}s)...")
+    proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"aria2c selective download failed (code {proc.returncode})")
+
+    video_files = []
+    for root, _, files in os.walk(download_dir):
+        for f in files:
+            if f.endswith((".mkv", ".mp4", ".avi", ".webm")) and not f.endswith((".aria2", ".torrent")):
+                fp = os.path.join(root, f)
+                sz = os.path.getsize(fp)
+                if sz > 1000:  # skip empty/placeholder files
+                    video_files.append((fp, f, sz))
+
+    return video_files
+
+
+def parse_episode_from_filename(filename: str) -> int:
+    """Extract episode number from a video filename. Handles various naming conventions."""
+    name = os.path.splitext(filename)[0]
+
+    # Pattern 1: Standard " - 01" or " - 001" (Erai-raws, SubsPlease style)
+    m = re.search(r'\s-\s(\d{2,4})\b', name)
+    if m:
+        return int(m.group(1))
+
+    # Pattern 2: "E01" or "EP01" or "Episode 01"
+    m = re.search(r'\b(?:e|ep|episode)\s*(\d{1,4})\b', name, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    # Pattern 3: "S01E05" style
+    m = re.search(r's\d+e(\d+)', name, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    # Pattern 4: Standalone number at end before quality tags "[720p]"
+    m = re.search(r'[\s_.-](\d{1,4})\s*[\[\(]', name)
+    if m:
+        return int(m.group(1))
+
+    # Pattern 5: Last number in the filename (fallback)
+    nums = re.findall(r'\b(\d{1,4})\b', name)
+    # Filter out common non-episode numbers (year, quality)
+    for n in nums:
+        val = int(n)
+        if val < 2000 and val not in (480, 720, 1080, 1440, 2160):
+            return val
+
+    return -1
+
 # ─── Media Inspection ──────────────────────────────────────────
 def inspect_media_tracks(video_path: str) -> tuple:
     ALLOWED_SUBS = {"Arabic", "English", "French", "Japanese"}
@@ -829,12 +970,14 @@ def inspect_media_tracks(video_path: str) -> tuple:
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
     url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
     auth = ("", PIXELDRAIN_API_KEY) if PIXELDRAIN_API_KEY else None
-    log_message(f"Uploading {filename}...")
+    file_size_mb = round(os.path.getsize(file_path) / 1048576, 1)
+    log_message(f"Uploading {filename} ({file_size_mb} MB)...")
     with open(file_path, "rb") as f:
-        with httpx.Client(timeout=300.0) as client:
+        with httpx.Client(timeout=600.0) as client:
             r = client.put(url, content=f.read(), auth=auth)
             if r.status_code in [200, 201]:
                 file_id = r.json().get("id")
+                log_message(f"Upload complete: {file_id}")
                 return {"id": file_id, "url": f"https://pixeldrain.com/api/file/{file_id}"}
             raise RuntimeError(f"Pixeldrain upload failed (HTTP {r.status_code}): {r.text}")
 
@@ -1185,28 +1328,406 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
             shutil.rmtree(dl_dir, ignore_errors=True)
 
 # ═══════════════════════════════════════════════════════════════
+#  Direct URL Mode — skip search, download specific torrent
+# ═══════════════════════════════════════════════════════════════
+
+async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, nyaa_url: str, force: bool = False) -> str:
+    """Download a specific torrent from a Nyaa URL, skipping search/matching entirely."""
+    romaji = anime_info["title"]["romaji"] or ""
+
+    # Get erai_title if stored
+    erai_rows = await execute_sql("SELECT erai_title FROM anime WHERE id = ?", [anime_db_id])
+    erai_title = erai_rows[0].get("erai_title") if erai_rows else None
+
+    # Get airing date for this episode (if available)
+    aired_at = 0
+    airing_nodes = anime_info.get("airingSchedule", {}).get("nodes", [])
+    for node in airing_nodes:
+        if node.get("episode") == ep_num:
+            aired_at = node.get("airingAt", 0)
+            break
+
+    # Check if episode already exists
+    existing = await execute_sql(
+        "SELECT id, pixeldrain_id, pixeldrain_1080_id, backup_720_id, backup_480_id FROM episodes WHERE anime_id = ? AND episode_number = ?",
+        [anime_db_id, ep_num]
+    )
+
+    if existing and not force:
+        return f"⏭️ Episode {ep_num} already exists (use Force to re-download)"
+
+    # If force, delete old Pixeldrain files first
+    if existing and force:
+        old = existing[0]
+        for key in ["pixeldrain_id", "pixeldrain_1080_id", "backup_720_id", "backup_480_id"]:
+            old_id = old.get(key)
+            if old_id:
+                log_message(f"🗑️ Deleting old Pixeldrain file: {old_id}")
+                delete_from_pixeldrain(old_id)
+        await execute_sql("DELETE FROM episodes WHERE id = ?", [old["id"]])
+        log_message(f"🗑️ Deleted old episode {ep_num} from DB")
+
+    # Insert episode as pending
+    await execute_sql("""
+        INSERT INTO episodes (anime_id, episode_number, status, aired_at)
+        VALUES (?, ?, 'pending', ?)
+        ON CONFLICT(anime_id, episode_number) DO NOTHING
+    """, [anime_db_id, ep_num, aired_at or int(time.time())])
+
+    # Get the ep_id
+    ep_row = await execute_sql(
+        "SELECT id FROM episodes WHERE anime_id = ? AND episode_number = ?",
+        [anime_db_id, ep_num]
+    )
+    if not ep_row:
+        return f"❌ Episode {ep_num}: Failed to create DB entry"
+    ep_id = ep_row[0]["id"]
+
+    # Convert Nyaa view URL to download URL if needed
+    torrent_url = nyaa_url.strip()
+    if "/view/" in torrent_url and "/download/" not in torrent_url:
+        # https://nyaa.si/view/1234567 -> https://nyaa.si/download/1234567.torrent
+        torrent_url = torrent_url.replace("/view/", "/download/") + ".torrent"
+
+    log_message(f"🎯 Direct URL: {torrent_url}")
+
+    # Download
+    dl_dir = None
+    try:
+        dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, torrent_url, f"Direct-Ep{ep_num}")
+        size_mb = round(v_size / 1048576, 2)
+        stored_source = (
+            f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(v_name)}"
+            if info_hash else torrent_url
+        )
+
+        subs_found, audio_found = inspect_media_tracks(v_path)
+        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}]")
+
+        audio_score = get_audio_score(v_name)
+        is_multi_audio = 1 if audio_score >= 1 else 0
+
+        upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+        pd_id = upload["id"]
+        pd_url = upload["url"]
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await execute_sql("""
+            UPDATE episodes
+            SET status = 'ready',
+                stream_url = ?,
+                pixeldrain_id = ?,
+                pixeldrain_1080_url = ?,
+                pixeldrain_1080_id = ?,
+                file_size_mb = ?,
+                magnet_link = ?,
+                is_multi_audio = ?,
+                audio_score = ?,
+                subtitles = ?,
+                audio_tracks = ?,
+                subtitles_1080 = ?,
+                audio_tracks_1080 = ?,
+                uploaded_at = ?,
+                last_checked = ?,
+                pending_review_until = 0
+            WHERE id = ?
+        """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
+              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
+
+        # Store parsed erai_title
+        parsed_erai = parse_erai_anime_title(v_name)
+        if parsed_erai and not erai_title:
+            await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_db_id])
+
+        return f"✅ Episode {ep_num}: {v_name} ({size_mb} MB) → Pixeldrain [{pd_id}] | Subs=[{subs_found}] Audio=[{audio_found}]"
+
+    except Exception as ex:
+        await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
+        return f"❌ Episode {ep_num}: {ex}"
+    finally:
+        if dl_dir:
+            shutil.rmtree(dl_dir, ignore_errors=True)
+
+# ═══════════════════════════════════════════════════════════════
+#  Batch Download Mode — one torrent, many episodes (chunked)
+# ═══════════════════════════════════════════════════════════════
+
+BATCH_CHUNK_SIZE = int(os.environ.get("BATCH_CHUNK_SIZE", "5"))
+
+async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: int, nyaa_url: str, force: bool = False) -> list:
+    """Download a batch torrent in chunks — download 5 files, upload them, delete, repeat.
+    This keeps disk usage under ~2 GB even for 30+ GB batch torrents."""
+    results = []
+
+    # Get erai_title if stored
+    erai_rows = await execute_sql("SELECT erai_title FROM anime WHERE id = ?", [anime_db_id])
+    erai_title = erai_rows[0].get("erai_title") if erai_rows else None
+
+    # Convert Nyaa view URL to download URL if needed
+    torrent_url = nyaa_url.strip()
+    if "/view/" in torrent_url and "/download/" not in torrent_url:
+        torrent_url = torrent_url.replace("/view/", "/download/") + ".torrent"
+
+    log_message(f"📦 Batch Download Mode (chunk size: {BATCH_CHUNK_SIZE})")
+    log_message(f"🔗 URL: {torrent_url}")
+    log_message(f"📋 Episodes requested: {len(episodes)} episodes ({episodes[0]}-{episodes[-1]})")
+    log_message("")
+
+    # Step 1: Fetch .torrent metadata only (tiny file)
+    dl_dir = None
+    try:
+        dl_dir, torrent_file_path, raw_payload = await asyncio.to_thread(fetch_torrent_file, torrent_url)
+        info_hash = extract_info_hash(raw_payload) if raw_payload else None
+        log_message(f"✅ Fetched .torrent metadata")
+    except Exception as ex:
+        return [f"❌ Failed to fetch .torrent file: {ex}"]
+
+    try:
+        # Step 2: List all files in the torrent
+        torrent_files = await asyncio.to_thread(list_torrent_files, torrent_file_path)
+        log_message(f"📁 Torrent contains {len(torrent_files)} files")
+
+        # Step 3: Map torrent file indices to episode numbers
+        ep_to_file_idx = {}  # ep_num -> {index, filename, size}
+        for tf in torrent_files:
+            fname = tf["filename"]
+            if not fname.endswith((".mkv", ".mp4", ".avi", ".webm")):
+                continue
+            ep_num = parse_episode_from_filename(fname)
+            if ep_num >= 0:
+                ep_to_file_idx[ep_num] = tf
+
+        log_message(f"🗺️ Mapped {len(ep_to_file_idx)} video files to episode numbers")
+        if ep_to_file_idx:
+            mapped_eps = sorted(ep_to_file_idx.keys())
+            log_message(f"   Range: {mapped_eps[0]}-{mapped_eps[-1]}")
+        log_message("")
+
+        # Filter episodes to only those available
+        available_eps = [ep for ep in episodes if ep in ep_to_file_idx]
+        missing_eps = [ep for ep in episodes if ep not in ep_to_file_idx]
+        for ep in missing_eps:
+            msg = f"❌ Episode {ep}: No matching file found in batch torrent"
+            results.append(msg)
+            log_message(msg)
+
+        if not available_eps:
+            log_message("❌ No requested episodes found in torrent!")
+            return results
+
+        # Pre-filter: skip already existing episodes (unless force)
+        eps_to_process = []
+        for ep_num in available_eps:
+            existing = await execute_sql(
+                "SELECT id FROM episodes WHERE anime_id = ? AND episode_number = ?",
+                [anime_db_id, ep_num]
+            )
+            if existing and not force:
+                msg = f"⏭️ Episode {ep_num} already exists (use Force to re-download)"
+                results.append(msg)
+                log_message(msg)
+            else:
+                eps_to_process.append(ep_num)
+
+        if not eps_to_process:
+            log_message("All episodes already exist!")
+            return results
+
+        log_message(f"\n🚀 Processing {len(eps_to_process)} episodes in chunks of {BATCH_CHUNK_SIZE}")
+        log_message("")
+
+        # Step 4: Process in chunks
+        for chunk_start in range(0, len(eps_to_process), BATCH_CHUNK_SIZE):
+            chunk_eps = eps_to_process[chunk_start:chunk_start + BATCH_CHUNK_SIZE]
+            chunk_num = (chunk_start // BATCH_CHUNK_SIZE) + 1
+            total_chunks = (len(eps_to_process) + BATCH_CHUNK_SIZE - 1) // BATCH_CHUNK_SIZE
+
+            log_message(f"{'═' * 50}")
+            log_message(f"📦 Chunk {chunk_num}/{total_chunks}: Episodes {chunk_eps}")
+            log_message(f"{'═' * 50}")
+
+            # Get file indices for this chunk
+            chunk_indices = [ep_to_file_idx[ep]["index"] for ep in chunk_eps]
+
+            # Download only these files
+            try:
+                downloaded_files = await asyncio.to_thread(
+                    download_selected_files, torrent_file_path, dl_dir, chunk_indices
+                )
+                log_message(f"✅ Downloaded {len(downloaded_files)} files for chunk {chunk_num}")
+            except Exception as ex:
+                for ep in chunk_eps:
+                    msg = f"❌ Episode {ep}: Download failed in chunk {chunk_num}: {ex}"
+                    results.append(msg)
+                    log_message(msg)
+                continue
+
+            # Map downloaded files to episode numbers
+            chunk_file_map = {}
+            for fp, fname, fsize in downloaded_files:
+                ep_from_file = parse_episode_from_filename(fname)
+                if ep_from_file >= 0:
+                    chunk_file_map[ep_from_file] = (fp, fname, fsize)
+
+            # Process each episode in this chunk
+            for ep_num in chunk_eps:
+                log_message(f"{'─' * 40}")
+                log_message(f"⏳ Episode {ep_num}...")
+
+                if ep_num not in chunk_file_map:
+                    msg = f"❌ Episode {ep_num}: File not found after download"
+                    results.append(msg)
+                    log_message(msg)
+                    continue
+
+                fp, fname, fsize = chunk_file_map[ep_num]
+
+                # Handle force: delete old data
+                existing = await execute_sql(
+                    "SELECT id, pixeldrain_id, pixeldrain_1080_id, backup_720_id, backup_480_id FROM episodes WHERE anime_id = ? AND episode_number = ?",
+                    [anime_db_id, ep_num]
+                )
+                if existing and force:
+                    old = existing[0]
+                    for key in ["pixeldrain_id", "pixeldrain_1080_id", "backup_720_id", "backup_480_id"]:
+                        old_id = old.get(key)
+                        if old_id:
+                            delete_from_pixeldrain(old_id)
+                    await execute_sql("DELETE FROM episodes WHERE id = ?", [old["id"]])
+
+                # Get airing date
+                aired_at = 0
+                airing_nodes = anime_info.get("airingSchedule", {}).get("nodes", [])
+                for node in airing_nodes:
+                    if node.get("episode") == ep_num:
+                        aired_at = node.get("airingAt", 0)
+                        break
+
+                # Insert episode
+                await execute_sql("""
+                    INSERT INTO episodes (anime_id, episode_number, status, aired_at)
+                    VALUES (?, ?, 'pending', ?)
+                    ON CONFLICT(anime_id, episode_number) DO NOTHING
+                """, [anime_db_id, ep_num, aired_at or int(time.time())])
+
+                ep_row = await execute_sql(
+                    "SELECT id FROM episodes WHERE anime_id = ? AND episode_number = ?",
+                    [anime_db_id, ep_num]
+                )
+                if not ep_row:
+                    msg = f"❌ Episode {ep_num}: Failed to create DB entry"
+                    results.append(msg)
+                    log_message(msg)
+                    continue
+                ep_id = ep_row[0]["id"]
+
+                try:
+                    size_mb = round(fsize / 1048576, 2)
+                    stored_source = (
+                        f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(fname)}"
+                        if info_hash else torrent_url
+                    )
+
+                    subs_found, audio_found = inspect_media_tracks(fp)
+                    log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}]")
+
+                    audio_score = get_audio_score(fname)
+                    is_multi_audio = 1 if audio_score >= 1 else 0
+
+                    upload = await asyncio.to_thread(upload_pixeldrain, fp, fname)
+                    pd_id = upload["id"]
+                    pd_url = upload["url"]
+
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    await execute_sql("""
+                        UPDATE episodes
+                        SET status = 'ready',
+                            stream_url = ?,
+                            pixeldrain_id = ?,
+                            pixeldrain_1080_url = ?,
+                            pixeldrain_1080_id = ?,
+                            file_size_mb = ?,
+                            magnet_link = ?,
+                            is_multi_audio = ?,
+                            audio_score = ?,
+                            subtitles = ?,
+                            audio_tracks = ?,
+                            subtitles_1080 = ?,
+                            audio_tracks_1080 = ?,
+                            uploaded_at = ?,
+                            last_checked = ?,
+                            pending_review_until = 0
+                        WHERE id = ?
+                    """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
+                          subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
+
+                    # Store parsed erai_title
+                    parsed_erai = parse_erai_anime_title(fname)
+                    if parsed_erai and not erai_title:
+                        await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_db_id])
+                        erai_title = parsed_erai
+
+                    msg = f"✅ Episode {ep_num}: {fname} ({size_mb} MB) → [{pd_id}]"
+                    results.append(msg)
+                    log_message(msg)
+
+                except Exception as ex:
+                    await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
+                    msg = f"❌ Episode {ep_num}: {ex}"
+                    results.append(msg)
+                    log_message(msg)
+
+            # Delete downloaded video files to free disk space for next chunk
+            for fp, fname, fsize in downloaded_files:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+            log_message(f"🗑️ Cleaned chunk {chunk_num} files to free disk space")
+            log_message("")
+
+    finally:
+        if dl_dir:
+            shutil.rmtree(dl_dir, ignore_errors=True)
+
+    return results
+
+# ═══════════════════════════════════════════════════════════════
 #  Orchestration
 # ═══════════════════════════════════════════════════════════════
 
-async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool) -> str:
+async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool, nyaa_url: str = "") -> str:
     clear_log()
     log_message("=" * 60)
     log_message("🤖 AniRec Content Analyzer - Starting")
     log_message("=" * 60)
 
     # Validate inputs
-    try:
-        anilist_id = int(anilist_id_str.strip())
-    except (ValueError, AttributeError):
-        return "❌ Invalid Media ID. Must be a number."
+    anilist_raw = anilist_id_str.strip()
+    # Support full AniList URL or direct ID
+    url_match = re.search(r'/anime/(\d+)', anilist_raw)
+    if url_match:
+        anilist_id = int(url_match.group(1))
+    else:
+        try:
+            anilist_id = int(anilist_raw)
+        except (ValueError, AttributeError):
+            return "❌ Invalid Media ID. Enter a number (e.g. 21) or full AniList URL."
 
     episodes = parse_episodes_input(episodes_str)
     if not episodes:
         return "❌ Invalid content range. Use formats like: 1-12, 5,8,10, or 1-5,8,10-12"
 
+    direct_mode = bool(nyaa_url and nyaa_url.strip())
+    batch_mode = direct_mode and len(episodes) > 1
+
     log_message(f"🎯 Media ID: {anilist_id}")
     log_message(f"📋 Segments: {episodes}")
     log_message(f"🔄 Force reprocess: {'Yes' if force else 'No'}")
+    if batch_mode:
+        log_message(f"📦 Batch mode: {nyaa_url.strip()}")
+    elif direct_mode:
+        log_message(f"🔗 Direct URL mode: {nyaa_url.strip()}")
     log_message("")
 
     # Fetch anime info
@@ -1253,15 +1774,22 @@ async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool) -> s
         return get_log()
     anime_db_id = db_row[0]["id"]
 
-    # Process each episode
+    # Process episodes
     results = []
-    for i, ep_num in enumerate(episodes):
-        log_message(f"{'─' * 50}")
-        log_message(f"⏳ Processing Episode {ep_num} ({i+1}/{len(episodes)})...")
-        result = await process_single_episode(anime_info, ep_num, anime_db_id, force=force)
-        results.append(result)
-        log_message(result)
-        log_message("")
+    if batch_mode:
+        # Batch: download once, process all episodes from the same torrent
+        results = await process_batch_download(anime_info, episodes, anime_db_id, nyaa_url.strip(), force=force)
+    else:
+        for i, ep_num in enumerate(episodes):
+            log_message(f"{'─' * 50}")
+            log_message(f"⏳ Processing Episode {ep_num} ({i+1}/{len(episodes)})...")
+            if direct_mode:
+                result = await process_direct_url(anime_info, ep_num, anime_db_id, nyaa_url.strip(), force=force)
+            else:
+                result = await process_single_episode(anime_info, ep_num, anime_db_id, force=force)
+            results.append(result)
+            log_message(result)
+            log_message("")
 
     # Summary
     log_message("=" * 60)
@@ -1284,16 +1812,19 @@ if __name__ == "__main__":
     anilist_id = os.environ.get("ANILIST_ID", "").strip()
     episodes = os.environ.get("EPISODES", "").strip()
     force = os.environ.get("FORCE_REDOWNLOAD", "false").lower() in ("true", "1", "yes")
+    nyaa_url = os.environ.get("NYAA_URL", "").strip()
 
     if not anilist_id or not episodes:
         print("Usage: Set ANILIST_ID and EPISODES environment variables")
         print('  ANILIST_ID=21 EPISODES="1-12" python app.py')
+        print('  ANILIST_ID=21 EPISODES="1" NYAA_URL="https://nyaa.si/view/..." python app.py')
         sys.exit(1)
 
-    result = asyncio.run(run_pipeline(anilist_id, episodes, force))
+    result = asyncio.run(run_pipeline(anilist_id, episodes, force, nyaa_url))
     print(result)
 
     # Exit with error code if any episodes failed
     if "❌" in result and "✅" not in result:
         sys.exit(1)
+
 
