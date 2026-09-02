@@ -766,33 +766,67 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     return download_dir, best_file[0], best_file[1], best_file[2], info_hash
 
 def fetch_torrent_file(torrent_source: str) -> tuple:
-    """Download just the .torrent metadata file. Returns (download_dir, torrent_file_path, raw_payload)."""
+    """Download just the .torrent metadata file. Returns (download_dir, torrent_file_path, raw_payload).
+    Tries direct download first (works on GitHub Actions), then falls back to GAS proxies."""
     download_dir = tempfile.mkdtemp(prefix="anime_batch_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
     raw_payload = None
 
     if torrent_source.startswith("http"):
-        sync_transport = httpx.HTTPTransport(retries=2)
-        for proxy_base in get_ordered_proxies():
-            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
+        # Try 1: Direct download (GitHub Actions can access nyaa.si directly)
+        try:
+            log_message(f"Trying direct download: {torrent_source}")
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                r = client.get(torrent_source, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200 and is_valid_torrent_data(r.content):
+                    with open(torrent_file_path, "wb") as f:
+                        f.write(r.content)
+                    raw_payload = r.content
+                    log_message(f"Direct download OK ({len(r.content)} bytes)")
+        except Exception as e:
+            log_message(f"Direct download failed: {e}")
+
+        # Try 2: GAS proxy fallback
+        if not raw_payload:
+            log_message("Falling back to GAS proxies...")
+            sync_transport = httpx.HTTPTransport(retries=2)
+            for proxy_base in get_ordered_proxies():
+                gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
+                try:
+                    with httpx.Client(transport=sync_transport, timeout=30.0) as client:
+                        r = client.get(gas_url)
+                        if r.status_code == 200:
+                            data = r.json()
+                            if data.get("status") == 200 and data.get("data"):
+                                raw_bytes = base64.b64decode(data["data"])
+                                if is_valid_torrent_data(raw_bytes):
+                                    with open(torrent_file_path, "wb") as f:
+                                        f.write(raw_bytes)
+                                    raw_payload = raw_bytes
+                                    log_message(f"GAS proxy OK ({len(raw_bytes)} bytes)")
+                                    break
+                except Exception:
+                    continue
+
+        # Try 3: aria2c direct download as last resort
+        if not raw_payload:
+            log_message("Trying aria2c direct download...")
             try:
-                with httpx.Client(transport=sync_transport, timeout=30.0) as client:
-                    r = client.get(gas_url)
-                    if r.status_code == 200:
-                        data = r.json()
-                        if data.get("status") == 200 and data.get("data"):
-                            raw_bytes = base64.b64decode(data["data"])
-                            if is_valid_torrent_data(raw_bytes):
-                                with open(torrent_file_path, "wb") as f:
-                                    f.write(raw_bytes)
-                                raw_payload = raw_bytes
-                                break
-            except Exception:
-                continue
+                cmd = ["aria2c", torrent_source, f"--dir={download_dir}", "-o", "download.torrent", "--timeout=30"]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if proc.returncode == 0 and os.path.exists(torrent_file_path):
+                    with open(torrent_file_path, "rb") as f:
+                        raw_payload = f.read()
+                    if not is_valid_torrent_data(raw_payload):
+                        raw_payload = None
+                    else:
+                        log_message(f"aria2c download OK ({len(raw_payload)} bytes)")
+            except Exception as e:
+                log_message(f"aria2c download failed: {e}")
 
     if not raw_payload:
         shutil.rmtree(download_dir, ignore_errors=True)
-        raise RuntimeError("Failed to fetch .torrent file from any proxy")
+        raise RuntimeError("Failed to fetch .torrent file from any source")
 
     return download_dir, torrent_file_path, raw_payload
 
