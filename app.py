@@ -1163,19 +1163,50 @@ query ($id: Int) {
 """
 
 async def fetch_anime_by_id(anilist_id: int) -> dict:
-    """Fetch anime info from AniList by ID."""
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(ANILIST_URL, json={
-            "query": ANILIST_MEDIA_QUERY,
-            "variables": {"id": anilist_id}
-        })
-        if r.status_code != 200:
-            raise RuntimeError(f"AniList API error: HTTP {r.status_code}")
-        data = r.json()
-        media = data.get("data", {}).get("Media")
-        if not media:
-            raise RuntimeError(f"Anime not found on AniList (ID: {anilist_id})")
-        return media
+    """Fetch anime info from AniList by ID with fallback to local database if AniList is down."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(ANILIST_URL, json={
+                "query": ANILIST_MEDIA_QUERY,
+                "variables": {"id": anilist_id}
+            })
+            if r.status_code == 200:
+                data = r.json()
+                media = data.get("data", {}).get("Media")
+                if media:
+                    return media
+    except Exception:
+        pass
+
+    # Fallback to local DB if AniList API is disabled or unreachable
+    db_rows = await execute_sql("""
+        SELECT id, title_romaji, title_english, title_native, synonyms,
+               cover_url, banner_url, synopsis, genres, format, status
+        FROM anime WHERE anilist_id = ?
+    """, [anilist_id])
+    if db_rows:
+        row = db_rows[0]
+        syns = json.loads(row.get("synonyms") or "[]") if isinstance(row.get("synonyms"), str) else []
+        genres = json.loads(row.get("genres") or "[]") if isinstance(row.get("genres"), str) else []
+        log_message(f"ℹ️ AniList API is offline; loaded '{row.get('title_romaji')}' from local database.")
+        return {
+            "id": anilist_id,
+            "title": {
+                "romaji": row.get("title_romaji") or "",
+                "english": row.get("title_english") or "",
+                "native": row.get("title_native") or ""
+            },
+            "format": row.get("format") or "TV",
+            "status": row.get("status") or "RELEASING",
+            "synonyms": syns,
+            "coverImage": {"large": row.get("cover_url") or ""},
+            "bannerImage": row.get("banner_url") or "",
+            "description": row.get("synopsis") or "",
+            "genres": genres,
+            "airingSchedule": {"nodes": []}
+        }
+
+    raise RuntimeError(f"AniList API is temporarily disabled worldwide and anime ID {anilist_id} is not in local database.")
 
 def parse_episodes_input(text: str) -> list:
     """Parse episode input: '1-12', '5,8,10', '1-5,8,10-12'"""
