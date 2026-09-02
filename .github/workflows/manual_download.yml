@@ -1,0 +1,53 @@
+name: Content Analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      anilist_id:
+        description: 'Media ID'
+        required: true
+        type: string
+      episodes:
+        description: 'Content range (e.g. "1-12" or "5,8,10")'
+        required: true
+        type: string
+      force:
+        description: 'Force reprocess existing entries'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: content-analyzer
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y aria2 ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run analysis
+        env:
+          ANILIST_ID: ${{ inputs.anilist_id }}
+          EPISODES: ${{ inputs.episodes }}
+          FORCE_REDOWNLOAD: ${{ inputs.force }}
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+          GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
+          GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 }}
+          GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 }}
+        run: python app.py
