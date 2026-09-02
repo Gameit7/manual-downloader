@@ -50,4 +50,5 @@ jobs:
           GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
           GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 }}
           GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 }}
+          GAS_PROXY_URL_4: ${{ secrets.GAS_PROXY_URL_4 }}
         run: python app.py
