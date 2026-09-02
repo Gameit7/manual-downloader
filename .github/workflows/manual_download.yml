@@ -16,6 +16,10 @@ on:
         required: false
         type: boolean
         default: false
+      nyaa_url:
+        description: 'Direct source URL (optional — skips search)'
+        required: false
+        type: string
 
 concurrency:
   group: content-analyzer
@@ -24,7 +28,7 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +38,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y aria2 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends aria2 ffmpeg
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -44,6 +48,7 @@ jobs:
           ANILIST_ID: ${{ inputs.anilist_id }}
           EPISODES: ${{ inputs.episodes }}
           FORCE_REDOWNLOAD: ${{ inputs.force }}
+          NYAA_URL: ${{ inputs.nyaa_url }}
           TURSO_URL: ${{ secrets.TURSO_URL }}
           TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
