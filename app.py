@@ -37,7 +37,7 @@ def get_ordered_proxies() -> list:
     return [GAS_PROXIES[(start + i) % n] for i in range(n)]
 
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "7200"))
-MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "7"))
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -1082,17 +1082,32 @@ def inspect_media_tracks(video_path: str) -> tuple:
 
     found_subs = set()
     found_audio = set()
+    duration_sec = 0
     try:
         cmd = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_streams", "-show_entries", "stream=codec_type:stream_tags=language,title",
+            "-show_format", "-show_streams",
+            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration",
             video_path
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
+            fmt_dur = data.get("format", {}).get("duration")
+            if fmt_dur:
+                try:
+                    duration_sec = int(round(float(fmt_dur)))
+                except (ValueError, TypeError):
+                    pass
+
             streams = data.get("streams", [])
             for s in streams:
+                if not duration_sec and s.get("duration"):
+                    try:
+                        duration_sec = int(round(float(s["duration"])))
+                    except (ValueError, TypeError):
+                        pass
+
                 c_type = s.get("codec_type")
                 tags = s.get("tags") or {}
                 lang_tag = tags.get("language")
@@ -1114,7 +1129,7 @@ def inspect_media_tracks(video_path: str) -> tuple:
     ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
     sorted_subs = sorted(found_subs, key=lambda x: ORDER.index(x) if x in ORDER else 99)
     sorted_audio = sorted(found_audio, key=lambda x: ORDER.index(x) if x in ORDER else 99)
-    return ", ".join(sorted_subs), ", ".join(sorted_audio)
+    return ", ".join(sorted_subs), ", ".join(sorted_audio), duration_sec
 
 # ─── Pixeldrain Upload & Delete ────────────────────────────────
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
@@ -1331,12 +1346,12 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     now_ts = int(time.time())
 
     def get_min_seeders_for_torrent_local(t_title: str) -> int:
-        is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_title.lower()))
-        if is_trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
+        is_erai = bool(re.search(r'\[?erai[-_ ]?raws\]?', t_title.lower()))
+        if is_erai and (aired_at > 0) and (now_ts - aired_at < 7200):
             return 1
-        elif is_trusted:
+        elif is_erai:
             return 2
-        return MIN_TORRENT_SEEDERS
+        return max(10, MIN_TORRENT_SEEDERS)
 
     def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
         if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
@@ -1488,8 +1503,8 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
             if info_hash else winner["magnet"]
         )
 
-        subs_found, audio_found = inspect_media_tracks(v_path)
-        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}]")
+        subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
+        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
 
         upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
         pd_id = upload["id"]
@@ -1511,6 +1526,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 audio_tracks = ?,
                 subtitles_1080 = ?,
                 audio_tracks_1080 = ?,
+                duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                 uploaded_at = ?,
                 last_checked = ?,
                 mirror_720_missing = 1,
@@ -1519,7 +1535,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 pending_review_until = 0
             WHERE id = ?
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+              subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
               int(time.time()), ep_id])
 
         # Store parsed erai_title
@@ -1610,8 +1626,8 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
             if info_hash else torrent_url
         )
 
-        subs_found, audio_found = inspect_media_tracks(v_path)
-        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}]")
+        subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
+        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
 
         audio_score = get_audio_score(v_name)
         is_multi_audio = 1 if audio_score >= 3 else 0
@@ -1636,6 +1652,7 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
                 audio_tracks = ?,
                 subtitles_1080 = ?,
                 audio_tracks_1080 = ?,
+                duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                 uploaded_at = ?,
                 last_checked = ?,
                 mirror_720_missing = 1,
@@ -1644,7 +1661,7 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
                 pending_review_until = 0
             WHERE id = ?
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+              subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
               int(time.time()), ep_id])
 
         # Store parsed erai_title
@@ -1845,8 +1862,8 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                         if info_hash else torrent_url
                     )
 
-                    subs_found, audio_found = inspect_media_tracks(fp)
-                    log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}]")
+                    subs_found, audio_found, duration_found = inspect_media_tracks(fp)
+                    log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
 
                     audio_score = get_audio_score(fname)
                     is_multi_audio = 1 if audio_score >= 3 else 0
@@ -1871,6 +1888,7 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                             audio_tracks = ?,
                             subtitles_1080 = ?,
                             audio_tracks_1080 = ?,
+                            duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                             uploaded_at = ?,
                             last_checked = ?,
                             mirror_720_missing = 1,
@@ -1879,7 +1897,7 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                             pending_review_until = 0
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-                          subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()),
+                          subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
                           int(time.time()), ep_id])
 
                     # Store parsed erai_title
@@ -1913,6 +1931,30 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
 
     return results
 
+async def ensure_database_schema():
+    try:
+        existing_cols = await execute_sql("PRAGMA table_info(episodes)")
+        existing = {row["name"] for row in existing_cols or []}
+        columns = {
+            "duration": "INTEGER",
+            "subtitles": "TEXT",
+            "audio_tracks": "TEXT",
+            "subtitles_1080": "TEXT",
+            "audio_tracks_1080": "TEXT",
+            "pixeldrain_1080_url": "TEXT",
+            "pixeldrain_1080_id": "TEXT",
+            "mirror_720_missing": "INTEGER NOT NULL DEFAULT 0",
+            "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
+            "mirror_updated_at": "INTEGER",
+            "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, col_type in columns.items():
+            if name not in existing:
+                await execute_sql(f"ALTER TABLE episodes ADD COLUMN {name} {col_type}")
+                log_message(f"Added column '{name}' to episodes table.")
+    except Exception as e:
+        log_message(f"Schema maintenance notice: {e}")
+
 # ═══════════════════════════════════════════════════════════════
 #  Orchestration
 # ═══════════════════════════════════════════════════════════════
@@ -1922,6 +1964,7 @@ async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool, nyaa
     log_message("=" * 60)
     log_message("🤖 AniRec Content Analyzer - Starting")
     log_message("=" * 60)
+    await ensure_database_schema()
 
     # Validate inputs
     anilist_raw = anilist_id_str.strip()
