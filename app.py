@@ -14,6 +14,7 @@ import email.utils
 import base64
 import httpx
 import sys
+import unicodedata
 
 # ─── Environment Configuration ──────────────────────────────────
 TURSO_URL = os.environ.get("TURSO_URL", "")
@@ -152,9 +153,16 @@ async def execute_sql_batch(statements: list) -> list:
 # ─── Title & Episode Parsing Functions ─────────────────────────
 # (Copied from sync_job.py IDENTICALLY to ensure matching results)
 
+def strip_accents(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    normalized = unicodedata.normalize('NFKD', text)
+    return "".join(c for c in normalized if unicodedata.category(c) != 'Mn')
+
 def clean_title(title: str) -> str:
     if not title or not isinstance(title, str):
         return ""
+    title = strip_accents(title)
     title = re.sub(r'\(.*?\)', '', title)
     title = re.sub(r'\[.*?\]', '', title)
     title = re.sub(r'[:\\/*?"<>|]', ' ', title)
@@ -538,6 +546,10 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
             if seg not in search_bases:
                 search_bases.append(seg)
     search_bases.extend([r_base, e_base])
+    raw_r = re.sub(r'[:\\/*?"<>|\[\]\(\)]', ' ', romaji).strip()
+    raw_r = re.sub(r'\s+', ' ', raw_r)
+    if raw_r and raw_r != r_base and raw_r not in search_bases:
+        search_bases.append(raw_r)
     if r_super and r_super not in search_bases:
         search_bases.append(r_super)
     if e_super and e_super not in search_bases:
