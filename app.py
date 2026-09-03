@@ -1380,8 +1380,15 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
         else:
             platforms_in_multi.add('other')
 
+    # Check detail pages if:
+    # 1. Multiple platforms in multi-subs (existing logic)
+    # 2. Or presence of a REPACK candidate alongside regular releases (new logic)
+    has_repack = any(bool(re.search(r'\b(repack|re-pack|v2)\b', r["title"].lower())) for r in good)
+    has_multiple_platforms = (len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2)
+    has_repack_check = (has_repack and len(good) >= 2)
+
     arabic_cache = {}
-    if len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2:
+    if has_multiple_platforms or has_repack_check:
         async def _check_arabic_for_item(item):
             magnet = item.get("magnet", "")
             view_url = None
@@ -1391,12 +1398,20 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 view_url = magnet
             else:
                 view_url = magnet
+
+            # 1. Direct fetch first
+            try:
+                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                    r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                    if r.status_code == 200 and "Subtitles Info" in r.text:
+                        return _has_arabic_variants(r.text)
+            except Exception:
+                pass
+
+            # 2. GAS proxy fallback
             for proxy_base in get_ordered_proxies():
                 try:
-                    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                        r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0"})
-                        if r.status_code == 200 and "Subtitles Info" in r.text:
-                            return _has_arabic_variants(r.text)
+                    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
                         gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
                         r2 = await client.get(gas_url)
                         if r2.status_code == 200:
@@ -1405,10 +1420,12 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                                 if data.get("data"):
                                     html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
                                     return _has_arabic_variants(html)
-                            except: pass
+                            except Exception:
+                                pass
                             return _has_arabic_variants(r2.text)
-                except: continue
-            return _has_arabic_variants(item.get("title",""))
+                except Exception:
+                    continue
+            return _has_arabic_variants(item.get("title", ""))
 
         check_tasks = [_check_arabic_for_item(r) for r in good]
         try:
@@ -1427,9 +1444,15 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     def _arabic_score(item):
         return 1 if arabic_cache.get(item["magnet"], False) else 0
 
-    if arabic_cache:
+    def _repack_score(item):
+        return 1 if re.search(r'\b(repack|re-pack|v2)\b', item["title"].lower()) else 0
+
+    any_arabic_found = any(arabic_cache.values()) if arabic_cache else False
+
+    if any_arabic_found:
         good.sort(key=lambda x: (
             _arabic_score(x),
+            _repack_score(x),
             get_audio_score(x["title"]),
             1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
             get_platform_score(x["title"]),
@@ -1440,6 +1463,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     else:
         good.sort(key=lambda x: (
             get_audio_score(x["title"]),
+            _repack_score(x),
             1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
             get_platform_score(x["title"]),
             get_quality_weight(x["title"]),
