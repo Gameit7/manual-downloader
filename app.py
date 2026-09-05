@@ -350,6 +350,9 @@ SEASON_STOPWORDS = {
 
 def get_clean_words(title: str) -> list:
     title_lower = title.lower()
+    # Strip video/audio codecs before stripping standalone numbers so 'h.264' doesn't leave stray 'h'
+    title_lower = re.sub(r'\b[hx][\.\-]?26[45](-[a-z0-9_]+)?\b', ' ', title_lower)
+    title_lower = re.sub(r'\b(aac|ddp|ac3|flac|dts)[\.\-]?\d*(\.\d+)?\b', ' ', title_lower)
     title_no_se = re.sub(r'\b(s\d+e\d+|s\d+|e\d+)\b', ' ', title_lower)
     title_no_num = re.sub(r'\b\d+\b', ' ', title_no_se)
     clean_t = title_no_num.replace('.', ' ').replace('-', ' ').replace("'", "")
@@ -368,7 +371,7 @@ def get_clean_words(title: str) -> list:
         w_stripped = w.strip("-'")
         if not w_stripped or w_stripped in SEASON_STOPWORDS or w_stripped in particles:
             continue
-        if len(w_stripped) >= 2 or (len(w_stripped) == 1 and w_stripped.isalnum()):
+        if len(w_stripped) >= 2 or (len(words) == 1 and w_stripped.isalnum()):
             filtered.append(w_stripped)
     return filtered
 
@@ -378,10 +381,12 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     t_lower = torrent_title.lower()
     synonyms = synonyms or []
 
+    # 1. Episode matching check and title scope identification
     m_ep = re.search(r'\b(?:s\d+)?e(\d+)\b', t_lower)
     if m_ep:
         if int(m_ep.group(1)) != ep:
             return False
+        title_end_pos = m_ep.start()
     else:
         bypass_ep_check = False
         if is_special and ep == 1:
@@ -389,10 +394,17 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             other_ep_match = re.search(r'\b(?:ep|episode|ep\.|sp|special)?\s*0*([2-9]|\d{2,})\b', clean_title_for_ep)
             if not other_ep_match:
                 bypass_ep_check = True
+                title_end_pos = len(torrent_title)
         if not bypass_ep_check:
-            ep_pattern = re.compile(rf'\b0*{ep}\b')
-            if not ep_pattern.search(t_lower):
-                return False
+            m_dash = re.search(r'\s+-\s+0*(\d+)\b', t_lower)
+            if m_dash and int(m_dash.group(1)) == ep:
+                title_end_pos = m_dash.start()
+            else:
+                ep_pattern = re.compile(rf'\b0*{ep}\b')
+                m_num = ep_pattern.search(t_lower)
+                if not m_num:
+                    return False
+                title_end_pos = m_num.start()
 
     torrent_season = get_season_number(torrent_title)
     clean_romaji = clean_title(romaji)
@@ -402,7 +414,20 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
         eng_s = get_season_number(clean_english)
         if eng_s > 1:
             target_season = eng_s
-    if torrent_season != target_season:
+
+    # Check if target_season was inferred solely from a trailing number in the base anime title (e.g. 'Thunder 3')
+    has_explicit_season_keyword = bool(
+        re.search(r'\b(?:season|cour|part|s\d+)\b|\b\d+(?:st|nd|rd|th)\s+season\b|\b(?:ii|iii|iv|v)\b', clean_romaji.lower()) or
+        (clean_english and re.search(r'\b(?:season|cour|part|s\d+)\b|\b\d+(?:st|nd|rd|th)\s+season\b|\b(?:ii|iii|iv|v)\b', clean_english.lower()))
+    )
+    is_trailing_title_number = (
+        not has_explicit_season_keyword and 
+        (bool(re.search(rf'\s+{target_season}$', clean_romaji.lower().strip())) or
+         (clean_english and bool(re.search(rf'\s+{target_season}$', clean_english.lower().strip()))))
+    )
+
+    season_matches = (torrent_season == target_season) or (is_trailing_title_number and (torrent_season == 1 or target_season == 1))
+    if not season_matches:
         return False
 
     target_part = get_part_number(clean_romaji) or (get_part_number(clean_english) if english else 0)
@@ -488,10 +513,11 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     if not romaji_match and not eng_match and not syn_match:
         return False
 
-    clean_matched_words = get_clean_words(romaji)
-    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower)) and len(clean_matched_words) >= 2
+    # 4. Extra words check on title scope (before episode marker)
+    torrent_title_scope = torrent_title[:title_end_pos] if title_end_pos > 0 else torrent_title
+    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_lower))
 
-    torrent_clean = clean_title(torrent_title)
+    torrent_clean = clean_title(torrent_title_scope)
     torrent_words = get_clean_words(torrent_clean)
     anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
     for syn in valid_synonyms:
@@ -1354,7 +1380,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 search_notes.append(res_note)
             if res_list:
                 all_results.extend(res_list)
-        if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', r["title"].lower())) for r in all_results):
+        if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', r["title"].lower())) for r in all_results):
             break
         if len(all_results) >= 10:
             break
@@ -1370,11 +1396,11 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     now_ts = int(time.time())
 
     def get_min_seeders_for_torrent_local(t_title: str) -> int:
-        is_erai = bool(re.search(r'\[?erai[-_ ]?raws\]?', t_title.lower()))
-        if is_erai and (aired_at > 0) and (now_ts - aired_at < 7200):
-            return 1
-        elif is_erai:
-            return 2
+        is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower()))
+        if is_trusted:
+            if (aired_at > 0) and (now_ts - aired_at < 7200):
+                return 2
+            return 8
         return max(10, MIN_TORRENT_SEEDERS)
 
     def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
@@ -1384,12 +1410,95 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
             return False
         return True
 
-    good = [
-        r for r in deduped
-        if r["seeders"] >= get_min_seeders_for_torrent_local(r["title"])
-        and not is_blacklisted_platform(r["title"])
-        and is_valid_release_date(r.get("pub_date", 0), aired_at)
-    ]
+    # ── Arabic Subtitle Inspection Helper ───────────────────────
+    def _has_arabic_variants(text: str) -> bool:
+        if not text: return False
+        t = text.lower()
+        # All Arabic variants: ara, ar, arabic, العربية, عربي
+        return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
+
+    arabic_cache = {}
+
+    async def _check_arabic_for_item(item):
+        magnet = item.get("magnet", "")
+        if magnet and magnet in arabic_cache:
+            return arabic_cache[magnet]
+
+        view_url = None
+        if "nyaa.si/download/" in magnet:
+            view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
+        elif "nyaa.si/view/" in magnet:
+            view_url = magnet
+        else:
+            view_url = magnet
+
+        # 1. Direct fetch first
+        try:
+            async with httpx.AsyncClient(trust_env=False, timeout=10.0, follow_redirects=True) as client:
+                r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                if r.status_code == 200:
+                    has_ar = _has_arabic_variants(r.text)
+                    if magnet:
+                        arabic_cache[magnet] = has_ar
+                    return has_ar
+        except Exception:
+            pass
+
+        # 2. GAS proxy fallback
+        for proxy_base in get_ordered_proxies():
+            try:
+                async with httpx.AsyncClient(trust_env=False, timeout=12.0, follow_redirects=True) as client:
+                    gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
+                    r2 = await client.get(gas_url)
+                    if r2.status_code == 200:
+                        try:
+                            data = r2.json()
+                            if data.get("data"):
+                                html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
+                                has_ar = _has_arabic_variants(html)
+                                if magnet:
+                                    arabic_cache[magnet] = has_ar
+                                return has_ar
+                        except Exception:
+                            pass
+                        has_ar = _has_arabic_variants(r2.text)
+                        if magnet:
+                            arabic_cache[magnet] = has_ar
+                        return has_ar
+            except Exception:
+                continue
+
+        has_ar = _has_arabic_variants(item.get("title", ""))
+        if magnet:
+            arabic_cache[magnet] = has_ar
+        return has_ar
+
+    PLATFORM_HOLD_SECONDS = 7200  # 2 hours wait period for blacklisted platforms (to give Crunchyroll a chance)
+
+    good = []
+    for r in deduped:
+        if r["seeders"] < get_min_seeders_for_torrent_local(r["title"]):
+            continue
+        if not is_valid_release_date(r.get("pub_date", 0), aired_at):
+            continue
+
+        # Blacklisted platform check (e.g. NF, Netflix, iQ, iQIYI)
+        if is_blacklisted_platform(r["title"]):
+            is_under_hold = (aired_at > 0) and (now_ts - aired_at < PLATFORM_HOLD_SECONDS)
+            if is_under_hold:
+                # Check torrent detail page for Arabic subtitles
+                has_ar = await _check_arabic_for_item(r)
+                if has_ar:
+                    log_message(f"Platform Bypass: Arabic subs found in {r['title'][:60]} -> Bypassing blacklist!")
+                    good.append(r)
+                else:
+                    rem_m = int((PLATFORM_HOLD_SECONDS - (now_ts - aired_at)) / 60)
+                    log_message(f"Platform Hold: {r['title'][:55]} (no Arabic subs, waiting {rem_m}m for CR)")
+                    continue
+            else:
+                good.append(r)
+        else:
+            good.append(r)
 
     if not good:
         hint = ""
@@ -1399,12 +1508,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
         await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
         return f"❌ Episode {ep_num}: No active torrents found{hint}"
 
-    # Arabic subtitle priority check (same as sync_job.py)
-    def _has_arabic_variants(text: str) -> bool:
-        if not text: return False
-        t = text.lower()
-        return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
-
+    # ── Arabic Subtitle Priority & Additional Checks ───────────
     multi_subs_candidates = [r for r in good if bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower()))]
     platforms_in_multi = set()
     for r in multi_subs_candidates:
@@ -1426,58 +1530,21 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     has_multiple_platforms = (len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2)
     has_repack_check = (has_repack and len(good) >= 2)
 
-    arabic_cache = {}
     if has_multiple_platforms or has_repack_check:
-        async def _check_arabic_for_item(item):
-            magnet = item.get("magnet", "")
-            view_url = None
-            if "nyaa.si/download/" in magnet:
-                view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
-            elif "nyaa.si/view/" in magnet:
-                view_url = magnet
-            else:
-                view_url = magnet
-
-            # 1. Direct fetch first
+        check_tasks = [r for r in good if r.get("magnet") not in arabic_cache]
+        if check_tasks:
             try:
-                async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                    r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-                    if r.status_code == 200 and "Subtitles Info" in r.text:
-                        return _has_arabic_variants(r.text)
-            except Exception:
-                pass
-
-            # 2. GAS proxy fallback
-            for proxy_base in get_ordered_proxies():
-                try:
-                    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-                        gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
-                        r2 = await client.get(gas_url)
-                        if r2.status_code == 200:
-                            try:
-                                data = r2.json()
-                                if data.get("data"):
-                                    html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
-                                    return _has_arabic_variants(html)
-                            except Exception:
-                                pass
-                            return _has_arabic_variants(r2.text)
-                except Exception:
-                    continue
-            return _has_arabic_variants(item.get("title", ""))
-
-        check_tasks = [_check_arabic_for_item(r) for r in good]
-        try:
-            results = await asyncio.gather(*check_tasks, return_exceptions=True)
-            for idx, res in enumerate(results):
-                if isinstance(res, Exception):
-                    arabic_cache[good[idx]["magnet"]] = False
-                else:
-                    arabic_cache[good[idx]["magnet"]] = bool(res)
-                    if res:
-                        log_message(f"Arabic subtitle found in: {good[idx]['title'][:60]}")
-        except Exception as e:
-            log_message(f"Arabic check failed: {e}")
+                results = await asyncio.gather(*[_check_arabic_for_item(r) for r in check_tasks], return_exceptions=True)
+                for idx, res in enumerate(results):
+                    m = check_tasks[idx].get("magnet", "")
+                    if isinstance(res, Exception):
+                        arabic_cache[m] = False
+                    else:
+                        arabic_cache[m] = bool(res)
+                        if res:
+                            log_message(f"Arabic subtitle found in: {check_tasks[idx]['title'][:60]}")
+            except Exception as e:
+                log_message(f"Arabic check failed: {e}")
 
     # Ranking (identical to sync_job.py)
     def _arabic_score(item):
@@ -1488,12 +1555,16 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
 
     any_arabic_found = any(arabic_cache.values()) if arabic_cache else False
 
+    def _trusted_group_score(title: str) -> int:
+        t = title.lower()
+        return 1 if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t)) else 0
+
     if any_arabic_found:
         good.sort(key=lambda x: (
             _arabic_score(x),
             _repack_score(x),
             get_audio_score(x["title"]),
-            1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+            _trusted_group_score(x["title"]),
             get_platform_score(x["title"]),
             get_quality_weight(x["title"]),
             get_source_weight(x["title"]),
@@ -1503,78 +1574,82 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
         good.sort(key=lambda x: (
             get_audio_score(x["title"]),
             _repack_score(x),
-            1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+            _trusted_group_score(x["title"]),
             get_platform_score(x["title"]),
             get_quality_weight(x["title"]),
             get_source_weight(x["title"]),
             x["seeders"]
         ), reverse=True)
 
-    winner = good[0]
-    torrent_title = winner["title"]
-    audio_score = get_audio_score(torrent_title)
-    is_multi_audio = 1 if audio_score >= 3 else 0
+    candidates = good[:3]
+    last_ex = None
+    for cand_idx, winner in enumerate(candidates):
+        torrent_title = winner["title"]
+        audio_score = get_audio_score(torrent_title)
+        is_multi_audio = 1 if audio_score >= 3 else 0
 
-    log_message(f"📦 Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio: {audio_score})")
+        log_message(f"📦 Selected candidate [{cand_idx+1}/{len(candidates)}]: {torrent_title} (Seeders: {winner['seeders']}, Audio: {audio_score})")
 
-    # Download
-    dl_dir = None
-    try:
-        dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
-        size_mb = round(v_size / 1048576, 2)
-        stored_source = (
-            f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(torrent_title)}"
-            if info_hash else winner["magnet"]
-        )
+        dl_dir = None
+        try:
+            dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
+            size_mb = round(v_size / 1048576, 2)
+            stored_source = (
+                f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(torrent_title)}"
+                if info_hash else winner["magnet"]
+            )
 
-        subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
-        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
+            subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
+            log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
 
-        upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-        pd_id = upload["id"]
-        pd_url = upload["url"]
+            upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+            pd_id = upload["id"]
+            pd_url = upload["url"]
 
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        await execute_sql("""
-            UPDATE episodes
-            SET status = 'ready',
-                stream_url = ?,
-                pixeldrain_id = ?,
-                pixeldrain_1080_url = ?,
-                pixeldrain_1080_id = ?,
-                file_size_mb = ?,
-                magnet_link = ?,
-                is_multi_audio = ?,
-                audio_score = ?,
-                subtitles = ?,
-                audio_tracks = ?,
-                subtitles_1080 = ?,
-                audio_tracks_1080 = ?,
-                duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
-                uploaded_at = ?,
-                last_checked = ?,
-                mirror_720_missing = 1,
-                mirror_480_missing = 1,
-                mirror_updated_at = ?,
-                pending_review_until = 0
-            WHERE id = ?
-        """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
-              int(time.time()), ep_id])
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            await execute_sql("""
+                UPDATE episodes
+                SET status = 'ready',
+                    stream_url = ?,
+                    pixeldrain_id = ?,
+                    pixeldrain_1080_url = ?,
+                    pixeldrain_1080_id = ?,
+                    file_size_mb = ?,
+                    magnet_link = ?,
+                    is_multi_audio = ?,
+                    audio_score = ?,
+                    subtitles = ?,
+                    audio_tracks = ?,
+                    subtitles_1080 = ?,
+                    audio_tracks_1080 = ?,
+                    duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
+                    uploaded_at = ?,
+                    last_checked = ?,
+                    mirror_720_missing = 1,
+                    mirror_480_missing = 1,
+                    mirror_updated_at = ?,
+                    pending_review_until = 0
+                WHERE id = ?
+            """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
+                  subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
+                  int(time.time()), ep_id])
 
-        # Store parsed erai_title
-        parsed_erai = parse_erai_anime_title(v_name)
-        if parsed_erai and not erai_title:
-            await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_db_id])
+            # Store parsed erai_title
+            parsed_erai = parse_erai_anime_title(v_name)
+            if parsed_erai and not erai_title:
+                await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_db_id])
 
-        return f"✅ Episode {ep_num}: {v_name} ({size_mb} MB) → Pixeldrain [{pd_id}] | Subs=[{subs_found}] Audio=[{audio_found}]"
+            return f"✅ Episode {ep_num}: {v_name} ({size_mb} MB) → Pixeldrain [{pd_id}] | Subs=[{subs_found}] Audio=[{audio_found}]"
 
-    except Exception as ex:
-        await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
-        return f"❌ Episode {ep_num}: {ex}"
-    finally:
-        if dl_dir:
-            shutil.rmtree(dl_dir, ignore_errors=True)
+        except Exception as ex:
+            last_ex = ex
+            log_message(f"⚠️ Candidate [{cand_idx+1}/{len(candidates)}] failed for Ep {ep_num} ({torrent_title}): {ex}")
+        finally:
+            if dl_dir:
+                shutil.rmtree(dl_dir, ignore_errors=True)
+
+    await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
+    return f"❌ Episode {ep_num}: All candidates failed. Last error: {last_ex}"
 
 # ═══════════════════════════════════════════════════════════════
 #  Direct URL Mode — skip search, download specific torrent
@@ -1971,6 +2046,7 @@ async def ensure_database_schema():
             "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
             "mirror_updated_at": "INTEGER",
             "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
+            "audio_upgrade_failed": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, col_type in columns.items():
             if name not in existing:
