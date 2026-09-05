@@ -1105,6 +1105,91 @@ def parse_episode_from_filename(filename: str) -> int:
 
     return -1
 
+def extract_skip_times(chapters: list, total_duration: int = 0) -> str:
+    """Extracts opening, ending, and recap skip intervals from MKV/MP4 chapters."""
+    if not chapters or not isinstance(chapters, list):
+        return None
+
+    OP_PATTERN = re.compile(r'\b(?:nc)?(?:op|opening|intro|theme)(?:[\s_]*\d+)?\b|オープニング|opテーマ', re.IGNORECASE)
+    ED_PATTERN = re.compile(r'\b(?:nc)?(?:ed|ending|outro|credits?)(?:[\s_]*\d+)?\b|エンディング|edテーマ', re.IGNORECASE)
+    RECAP_PATTERN = re.compile(r'\b(?:recap|summary|previously|catch[\s-]*up)\b|あらすじ|ダイジェスト|前回のあらすじ', re.IGNORECASE)
+
+    # Sort chapters by start_time
+    valid_chs = []
+    for ch in chapters:
+        if isinstance(ch, dict):
+            try:
+                s = float(ch.get("start_time", 0))
+                valid_chs.append((s, ch))
+            except (ValueError, TypeError):
+                continue
+    valid_chs.sort(key=lambda x: x[0])
+
+    extracted = []
+
+    for i, (start_sec, ch) in enumerate(valid_chs):
+        tags = ch.get("tags") or {}
+        title = ""
+        for k, v in tags.items():
+            if k.lower() == "title" and isinstance(v, str):
+                title = v.strip()
+                break
+        if not title:
+            for k, v in ch.items():
+                if k.lower() == "title" and isinstance(v, str):
+                    title = v.strip()
+                    break
+        if not title:
+            continue
+
+        skip_type = None
+        clean_title = None
+
+        if OP_PATTERN.search(title):
+            skip_type = "op"
+            clean_title = "Opening"
+        elif ED_PATTERN.search(title):
+            skip_type = "ed"
+            clean_title = "Ending"
+        elif RECAP_PATTERN.search(title):
+            skip_type = "recap"
+            clean_title = "Recap"
+
+        if not skip_type:
+            continue
+
+        try:
+            end_sec = float(ch.get("end_time") or 0)
+        except (ValueError, TypeError):
+            end_sec = 0.0
+
+        # Handle MKV simple chapters where end_time is implicit
+        if end_sec <= start_sec:
+            if i + 1 < len(valid_chs):
+                next_start = valid_chs[i + 1][0]
+                if next_start > start_sec:
+                    end_sec = next_start
+            elif total_duration and total_duration > start_sec:
+                end_sec = float(total_duration)
+
+        dur = end_sec - start_sec
+        if start_sec >= 0 and end_sec > start_sec and (15.0 <= dur <= 240.0):
+            # Avoid duplicate intervals for same skip type within 30 seconds
+            if any(x["skipType"] == skip_type and abs(x["startTime"] - start_sec) < 30 for x in extracted):
+                continue
+            extracted.append({
+                "skipType": skip_type,
+                "startTime": round(start_sec, 2),
+                "endTime": round(end_sec, 2),
+                "title": clean_title or title
+            })
+
+    if not extracted:
+        return None
+
+    extracted.sort(key=lambda x: x["startTime"])
+    return json.dumps(extracted, ensure_ascii=False)
+
 # ─── Media Inspection ──────────────────────────────────────────
 def inspect_media_tracks(video_path: str) -> tuple:
     ALLOWED_SUBS = {"Arabic", "English", "French", "Japanese"}
@@ -1132,12 +1217,13 @@ def inspect_media_tracks(video_path: str) -> tuple:
 
     found_subs = set()
     found_audio = set()
+    skip_times_json = None
     duration_sec = 0
     try:
         cmd = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_format", "-show_streams",
-            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration",
+            "-show_format", "-show_streams", "-show_chapters",
+            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration:chapter=start_time,end_time:chapter_tags=title,TITLE",
             video_path
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -1171,6 +1257,8 @@ def inspect_media_tracks(video_path: str) -> tuple:
                         found_audio.add(resolved)
                     elif not resolved and not found_audio:
                         found_audio.add("Japanese")
+
+            skip_times_json = extract_skip_times(data.get("chapters", []), duration_sec)
     except Exception as e:
         log_message(f"Media probe warning: {e}")
 
@@ -1179,7 +1267,7 @@ def inspect_media_tracks(video_path: str) -> tuple:
     ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
     sorted_subs = sorted(found_subs, key=lambda x: ORDER.index(x) if x in ORDER else 99)
     sorted_audio = sorted(found_audio, key=lambda x: ORDER.index(x) if x in ORDER else 99)
-    return ", ".join(sorted_subs), ", ".join(sorted_audio), duration_sec
+    return ", ".join(sorted_subs), ", ".join(sorted_audio), duration_sec, skip_times_json
 
 # ─── Pixeldrain Upload & Delete ────────────────────────────────
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
@@ -1599,8 +1687,8 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                 if info_hash else winner["magnet"]
             )
 
-            subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
-            log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
+            subs_found, audio_found, duration_found, skip_times_found = inspect_media_tracks(v_path)
+            log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s Chapters={bool(skip_times_found)}")
 
             upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
             pd_id = upload["id"]
@@ -1622,6 +1710,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                     audio_tracks = ?,
                     subtitles_1080 = ?,
                     audio_tracks_1080 = ?,
+                    skip_times = ?,
                     duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                     uploaded_at = ?,
                     last_checked = ?,
@@ -1631,7 +1720,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                     pending_review_until = 0
                 WHERE id = ?
             """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-                  subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
+                  subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
                   int(time.time()), ep_id])
 
             # Store parsed erai_title
@@ -1725,8 +1814,8 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
             if info_hash else torrent_url
         )
 
-        subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
-        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
+        subs_found, audio_found, duration_found, skip_times_found = inspect_media_tracks(v_path)
+        log_message(f"🎵 Tracks: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s Chapters={bool(skip_times_found)}")
 
         audio_score = get_audio_score(v_name)
         is_multi_audio = 1 if audio_score >= 3 else 0
@@ -1751,6 +1840,7 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
                 audio_tracks = ?,
                 subtitles_1080 = ?,
                 audio_tracks_1080 = ?,
+                skip_times = ?,
                 duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                 uploaded_at = ?,
                 last_checked = ?,
@@ -1760,7 +1850,7 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
                 pending_review_until = 0
             WHERE id = ?
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-              subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
+              subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
               int(time.time()), ep_id])
 
         # Store parsed erai_title
@@ -1961,8 +2051,8 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                         if info_hash else torrent_url
                     )
 
-                    subs_found, audio_found, duration_found = inspect_media_tracks(fp)
-                    log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
+                    subs_found, audio_found, duration_found, skip_times_found = inspect_media_tracks(fp)
+                    log_message(f"🎵 Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s Chapters={bool(skip_times_found)}")
 
                     audio_score = get_audio_score(fname)
                     is_multi_audio = 1 if audio_score >= 3 else 0
@@ -1987,6 +2077,7 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                             audio_tracks = ?,
                             subtitles_1080 = ?,
                             audio_tracks_1080 = ?,
+                            skip_times = ?,
                             duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
                             uploaded_at = ?,
                             last_checked = ?,
@@ -1996,7 +2087,7 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                             pending_review_until = 0
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
-                          subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()),
+                          subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
                           int(time.time()), ep_id])
 
                     # Store parsed erai_title
@@ -2047,6 +2138,7 @@ async def ensure_database_schema():
             "mirror_updated_at": "INTEGER",
             "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
             "audio_upgrade_failed": "INTEGER NOT NULL DEFAULT 0",
+            "skip_times": "TEXT",
         }
         for name, col_type in columns.items():
             if name not in existing:
