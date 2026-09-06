@@ -940,6 +940,84 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
                 except Exception:
                     continue
 
+    # Fast-Path: Check for direct HTTP webseed (e.g. Doomdos file.fumodub.com or BEP 19 webseeds)
+    if raw_payload:
+        try:
+            meta, _ = _bdecode(raw_payload)
+            info = meta.get("info", {})
+            target_video_filename = None
+            if "files" not in info and "name" in info:
+                name = info["name"]
+                target_video_filename = name.decode("utf-8", errors="replace") if isinstance(name, bytes) else str(name)
+
+            url_list = meta.get("url-list")
+            if url_list:
+                if isinstance(url_list, bytes):
+                    candidate_urls = [url_list.decode("utf-8", errors="replace")]
+                elif isinstance(url_list, list):
+                    candidate_urls = [
+                        u.decode("utf-8", errors="replace") if isinstance(u, bytes) else str(u)
+                        for u in url_list
+                    ]
+                else:
+                    candidate_urls = [str(url_list)]
+
+                for cu in candidate_urls:
+                    cu = cu.strip()
+                    if cu.startswith(("http://", "https://")):
+                        parts = urllib.parse.urlsplit(cu)
+                        encoded_path = urllib.parse.quote(parts.path, safe="/:@!$&'()*+,;=")
+                        clean_url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, encoded_path, parts.query, parts.fragment))
+
+                        # Quick probe with 5s timeout
+                        is_reachable = False
+                        try:
+                            req = urllib.request.Request(
+                                clean_url,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                    "Range": "bytes=0-10"
+                                }
+                            )
+                            with urllib.request.urlopen(req, timeout=5) as probe_resp:
+                                if probe_resp.status in (200, 206):
+                                    is_reachable = True
+                        except Exception as probe_err:
+                            log_message(f"Webseed probe failed for {clean_url}: {probe_err}")
+
+                        if is_reachable:
+                            if not target_video_filename:
+                                target_video_filename = os.path.basename(parts.path) or "downloaded_video.mkv"
+
+                            target_file_path = os.path.join(download_dir, target_video_filename)
+                            log_message(f"🚀 Direct HTTP webseed detected: {clean_url}")
+                            log_message(f"⚡ Downloading directly from high-speed server via aria2c (16 parallel connections)...")
+
+                            http_cmd = [
+                                "aria2c",
+                                clean_url,
+                                f"--dir={download_dir}",
+                                "-o", target_video_filename,
+                                "--max-connection-per-server=16",
+                                "--split=16",
+                                "--min-split-size=1M",
+                                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                "--header=Accept: */*",
+                                "--summary-interval=5",
+                                "--allow-overwrite=true",
+                            ]
+
+                            retcode, captured = run_aria2c_with_progress(http_cmd, timeout_sec=TORRENT_DOWNLOAD_TIMEOUT)
+                            if retcode == 0 and os.path.exists(target_file_path) and os.path.getsize(target_file_path) > 1000:
+                                v_size = os.path.getsize(target_file_path)
+                                log_message(f"✅ Webseed direct download complete: {target_video_filename} ({round(v_size / 1048576, 2)} MB)")
+                                info_hash = extract_info_hash(raw_payload)
+                                return download_dir, target_file_path, target_video_filename, v_size, info_hash
+                            else:
+                                log_message("⚠️ Webseed download did not complete successfully. Falling back to BitTorrent P2P...")
+        except Exception as ws_err:
+            log_message(f"Webseed check warning: {ws_err}")
+
     trackers_arg = ",".join(NYAA_TRACKERS)
     cmd = [
         "aria2c", torrent_input,
@@ -953,6 +1031,8 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
         "--bt-max-peers=100",
         f"--bt-tracker={trackers_arg}",
         "--max-connection-per-server=16",
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--header=Accept: */*",
         "--summary-interval=5",
         "--allow-overwrite=true",
     ]
@@ -1134,6 +1214,8 @@ def download_selected_files(torrent_file_path: str, download_dir: str, file_indi
         "--bt-max-peers=100",
         f"--bt-tracker={trackers_arg}",
         "--max-connection-per-server=16",
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--header=Accept: */*",
         "--summary-interval=5",
         "--allow-overwrite=true",
     ]
