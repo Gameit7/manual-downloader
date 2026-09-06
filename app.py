@@ -1476,6 +1476,13 @@ def parse_episodes_input(text: str) -> list:
                 continue
     return sorted(episodes)
 
+def parse_direct_urls(raw: str) -> list:
+    """Parse direct URLs from input: handles commas, newlines, semicolons, or whitespace."""
+    if not raw or not raw.strip():
+        return []
+    tokens = re.split(r'[\r\n,;]+', raw.strip())
+    return [t.strip() for t in tokens if t.strip().startswith(('http://', 'https://', 'magnet:?'))]
+
 async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int, force: bool = False) -> str:
     """Process a single episode: search -> download -> inspect -> upload -> update DB."""
     romaji = anime_info["title"]["romaji"] or ""
@@ -2261,16 +2268,23 @@ async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool, nyaa
     if not episodes:
         return "❌ Invalid content range. Use formats like: 1-12, 5,8,10, or 1-5,8,10-12"
 
-    direct_mode = bool(nyaa_url and nyaa_url.strip())
-    batch_mode = direct_mode and len(episodes) > 1
+    direct_urls = parse_direct_urls(nyaa_url)
+    multi_direct_mode = len(direct_urls) > 1
+    batch_mode = len(direct_urls) == 1 and len(episodes) > 1
+    single_direct_mode = len(direct_urls) == 1 and len(episodes) == 1
 
     log_message(f"🎯 Media ID: {anilist_id}")
     log_message(f"📋 Segments: {episodes}")
     log_message(f"🔄 Force reprocess: {'Yes' if force else 'No'}")
-    if batch_mode:
-        log_message(f"📦 Batch mode: {nyaa_url.strip()}")
-    elif direct_mode:
-        log_message(f"🔗 Direct URL mode: {nyaa_url.strip()}")
+    if multi_direct_mode:
+        log_message(f"🔗 Multi-Direct URL mode: {len(direct_urls)} URLs provided for {len(episodes)} episode(s)")
+        for idx, ep_n in enumerate(episodes):
+            u_info = direct_urls[idx] if idx < len(direct_urls) else "⚠️ (No URL - will search automatically)"
+            log_message(f"   - Ep {ep_n} -> {u_info}")
+    elif batch_mode:
+        log_message(f"📦 Batch mode: {direct_urls[0]}")
+    elif single_direct_mode:
+        log_message(f"🔗 Direct URL mode: {direct_urls[0]}")
     log_message("")
 
     # Fetch anime info
@@ -2321,13 +2335,21 @@ async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool, nyaa
     results = []
     if batch_mode:
         # Batch: download once, process all episodes from the same torrent
-        results = await process_batch_download(anime_info, episodes, anime_db_id, nyaa_url.strip(), force=force)
+        results = await process_batch_download(anime_info, episodes, anime_db_id, direct_urls[0], force=force)
     else:
         for i, ep_num in enumerate(episodes):
             log_message(f"{'─' * 50}")
             log_message(f"⏳ Processing Episode {ep_num} ({i+1}/{len(episodes)})...")
-            if direct_mode:
-                result = await process_direct_url(anime_info, ep_num, anime_db_id, nyaa_url.strip(), force=force)
+            if multi_direct_mode:
+                if i < len(direct_urls):
+                    ep_url = direct_urls[i]
+                    log_message(f"🔗 Direct URL for Episode {ep_num}: {ep_url}")
+                    result = await process_direct_url(anime_info, ep_num, anime_db_id, ep_url, force=force)
+                else:
+                    log_message(f"⚠️ No direct URL provided for Episode {ep_num}, falling back to auto-search...")
+                    result = await process_single_episode(anime_info, ep_num, anime_db_id, force=force)
+            elif single_direct_mode:
+                result = await process_direct_url(anime_info, ep_num, anime_db_id, direct_urls[0], force=force)
             else:
                 result = await process_single_episode(anime_info, ep_num, anime_db_id, force=force)
             results.append(result)
