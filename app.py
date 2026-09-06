@@ -832,6 +832,71 @@ def is_valid_torrent_data(data: bytes) -> bool:
         return False
     return data.startswith(b"d") and (b"announce" in data or b"info" in data)
 
+ARIA2C_PROGRESS_REGEX = re.compile(
+    r'\[#\w+\s+([0-9.]+\w+)/([0-9.]+\w+)\((\d+)%\)(?:.*?CN:(\d+))?(?:.*?SD:(\d+))?(?:.*?DL:([0-9.]+\w+(?:/s)?))?(?:.*?ETA:(\w+))?'
+)
+
+def run_aria2c_with_progress(cmd: list, timeout_sec: int) -> tuple:
+    """Executes aria2c and streams progress in real-time, logging every 5% increment."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    last_logged_pct = -1
+    last_zero_log_time = 0
+    captured_lines = []
+    start_time = time.time()
+
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        if not line:
+            time.sleep(0.05)
+            continue
+
+        captured_lines.append(line)
+        if len(captured_lines) > 60:
+            captured_lines.pop(0)
+
+        clean_line = line.strip()
+        m = ARIA2C_PROGRESS_REGEX.search(clean_line)
+        if m:
+            dl_size, total_size, pct_str, cn, sd, speed, eta = m.groups()
+            try:
+                pct = int(pct_str)
+            except ValueError:
+                pct = 0
+
+            now = time.time()
+            if pct > 0:
+                if last_logged_pct < 0 or (pct // 5) > (last_logged_pct // 5) or pct == 100:
+                    milestone = (pct // 5) * 5 if pct < 100 else 100
+                    sd_info = f" | Seeders: {sd}" if sd else ""
+                    sp_info = f" @ {speed}" if speed else ""
+                    eta_info = f" | ETA: {eta}" if eta else ""
+                    log_message(f"📥 Download: {milestone}% ({dl_size} / {total_size}){sp_info}{sd_info}{eta_info}")
+                    last_logged_pct = pct
+            else:
+                if now - last_zero_log_time >= 25:
+                    cn_info = f"Connections: {cn or 0}"
+                    sd_info = f", Seeders: {sd or 0}" if sd else ""
+                    log_message(f"⏳ Connecting to peers: 0% ({cn_info}{sd_info})")
+                    last_zero_log_time = now
+
+        if (time.time() - start_time) > timeout_sec:
+            proc.kill()
+            log_message(f"❌ aria2c exceeded download timeout of {timeout_sec}s")
+            return -1, "".join(captured_lines)
+
+    proc.wait()
+    return proc.returncode, "".join(captured_lines)
+
 def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
@@ -888,18 +953,18 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
         "--bt-max-peers=100",
         f"--bt-tracker={trackers_arg}",
         "--max-connection-per-server=16",
-        "--summary-interval=10",
+        "--summary-interval=5",
         "--allow-overwrite=true",
     ]
 
     log_message(f"Starting download: {torrent_title}")
-    proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
-    if proc.returncode != 0:
+    retcode, captured = run_aria2c_with_progress(cmd, timeout_sec=TORRENT_DOWNLOAD_TIMEOUT)
+    if retcode != 0:
         shutil.rmtree(download_dir, ignore_errors=True)
-        err_detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
-        last_lines = "\n".join(err_detail.splitlines()[-10:])
+        last_lines = "\n".join(captured.splitlines()[-10:])
         log_message(f"aria2c error output:\n{last_lines}")
-        raise RuntimeError(f"aria2c failed with code {proc.returncode}: {last_lines[-200:] if last_lines else 'no output'}")
+        raise RuntimeError(f"aria2c failed with code {retcode}: {last_lines[-200:] if last_lines else 'no output'}")
+
 
 
     video_files = []
@@ -1069,14 +1134,17 @@ def download_selected_files(torrent_file_path: str, download_dir: str, file_indi
         "--bt-max-peers=100",
         f"--bt-tracker={trackers_arg}",
         "--max-connection-per-server=16",
-        "--summary-interval=15",
+        "--summary-interval=5",
         "--allow-overwrite=true",
     ]
 
     log_message(f"Downloading files {indices_str} (timeout={TORRENT_DOWNLOAD_TIMEOUT}s)...")
-    proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"aria2c selective download failed (code {proc.returncode})")
+    retcode, captured = run_aria2c_with_progress(cmd, timeout_sec=TORRENT_DOWNLOAD_TIMEOUT)
+    if retcode != 0:
+        last_lines = "\n".join(captured.splitlines()[-10:])
+        log_message(f"aria2c error output:\n{last_lines}")
+        raise RuntimeError(f"aria2c selective download failed (code {retcode})")
+
 
     video_files = []
     for root, _, files in os.walk(download_dir):
