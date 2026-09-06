@@ -839,33 +839,48 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     torrent_input = torrent_source
 
     if torrent_source.startswith("http"):
-        sync_transport = httpx.HTTPTransport(retries=2)
-        for proxy_base in get_ordered_proxies():
-            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
-            try:
-                with httpx.Client(transport=sync_transport, timeout=30.0) as client:
-                    r = client.get(gas_url)
-                    if r.status_code == 200:
-                        data = r.json()
-                        if data.get("status") == 200 and data.get("data"):
-                            raw_bytes = base64.b64decode(data["data"])
-                            if is_valid_torrent_data(raw_bytes):
-                                with open(torrent_file_path, "wb") as f:
-                                    f.write(raw_bytes)
-                                raw_payload = raw_bytes
-                                torrent_input = torrent_file_path
-                                break
-            except Exception:
-                continue
-    else:
-        torrent_input = torrent_source
+        # Try 1: Direct httpx download with browser User-Agent
+        try:
+            log_message(f"Fetching torrent file: {torrent_source}")
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+                r = client.get(torrent_source, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                if r.status_code == 200 and is_valid_torrent_data(r.content):
+                    with open(torrent_file_path, "wb") as f:
+                        f.write(r.content)
+                    raw_payload = r.content
+                    torrent_input = torrent_file_path
+                    log_message(f"Torrent file downloaded directly ({len(r.content)} bytes)")
+        except Exception as e:
+            log_message(f"Direct torrent download failed: {e}")
+
+        # Try 2: GAS proxy fallback if direct failed
+        if not raw_payload:
+            sync_transport = httpx.HTTPTransport(retries=2)
+            for proxy_base in get_ordered_proxies():
+                gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
+                try:
+                    with httpx.Client(transport=sync_transport, timeout=30.0) as client:
+                        r = client.get(gas_url)
+                        if r.status_code == 200:
+                            data = r.json()
+                            if data.get("status") == 200 and data.get("data"):
+                                raw_bytes = base64.b64decode(data["data"])
+                                if is_valid_torrent_data(raw_bytes):
+                                    with open(torrent_file_path, "wb") as f:
+                                        f.write(raw_bytes)
+                                    raw_payload = raw_bytes
+                                    torrent_input = torrent_file_path
+                                    log_message(f"Torrent file downloaded via GAS proxy ({len(raw_bytes)} bytes)")
+                                    break
+                except Exception:
+                    continue
 
     trackers_arg = ",".join(NYAA_TRACKERS)
     cmd = [
         "aria2c", torrent_input,
         f"--dir={download_dir}",
         "--seed-time=0",
-        "--bt-stop-timeout=120",
+        "--bt-stop-timeout=300",
         "--file-allocation=none",
         "--enable-dht=true",
         "--enable-peer-exchange=true",
@@ -881,7 +896,11 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
     if proc.returncode != 0:
         shutil.rmtree(download_dir, ignore_errors=True)
-        raise RuntimeError(f"aria2c failed with code {proc.returncode}")
+        err_detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        last_lines = "\n".join(err_detail.splitlines()[-10:])
+        log_message(f"aria2c error output:\n{last_lines}")
+        raise RuntimeError(f"aria2c failed with code {proc.returncode}: {last_lines[-200:] if last_lines else 'no output'}")
+
 
     video_files = []
     for root, _, files in os.walk(download_dir):
