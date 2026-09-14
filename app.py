@@ -21,6 +21,11 @@ TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
 
+TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0").strip() or "0")
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = int(os.environ.get("TELEGRAM_CHANNEL_ID", "0").strip() or "0")
+
 GAS_PROXIES = []
 for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3", "GAS_PROXY_URL_4"]:
     _v = os.environ.get(_k, "").strip()
@@ -28,6 +33,9 @@ for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3", "GAS_PROXY_URL
         GAS_PROXIES.append(_v)
 
 _proxy_idx = 0
+PROXY_COOLDOWNS = {}  # {proxy_url: failure_timestamp}
+PROXY_COOLDOWN_SECONDS = 300  # 5 minutes cooldown for failing proxy
+
 def get_ordered_proxies() -> list:
     global _proxy_idx
     if not GAS_PROXIES:
@@ -36,6 +44,22 @@ def get_ordered_proxies() -> list:
     start = _proxy_idx % n
     _proxy_idx += 1
     return [GAS_PROXIES[(start + i) % n] for i in range(n)]
+
+def get_healthy_proxies() -> list:
+    now = time.time()
+    ordered = get_ordered_proxies()
+    if not ordered:
+        return []
+    healthy = [p for p in ordered if (now - PROXY_COOLDOWNS.get(p, 0)) > PROXY_COOLDOWN_SECONDS]
+    if not healthy:
+        healthy = sorted(ordered, key=lambda p: PROXY_COOLDOWNS.get(p, 0))
+    return healthy
+
+def mark_proxy_failure(proxy_url: str):
+    PROXY_COOLDOWNS[proxy_url] = time.time()
+
+def mark_proxy_success(proxy_url: str):
+    PROXY_COOLDOWNS.pop(proxy_url, None)
 
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "7200"))
 MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
@@ -728,99 +752,135 @@ def extract_info_hash(payload: bytes) -> str:
     return None
 
 # ─── Nyaa Search & Proxy Integration ──────────────────────────
+def _parse_nyaa_rss_body(text: str, content: bytes, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> tuple:
+    """Parses XML RSS or JSON proxy body into matching torrent items. Returns (results, raw_count, error_msg)."""
+    raw_items = []
+    text_stripped = text.strip() if text else ""
+    if text_stripped.startswith("{"):
+        try:
+            data = json.loads(text_stripped)
+        except Exception:
+            return [], 0, "invalid JSON body"
+        payload = data.get("data")
+        if not isinstance(payload, list):
+            return [], 0, f"proxy error payload ({data.get('error') or data.get('status')})"
+        for item in payload:
+            raw_items.append({
+                "title": item.get("title", ""),
+                "torrent": item.get("torrent", ""),
+                "seeders": int(item.get("seeders") or 0),
+                "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
+            })
+    elif "<rss" in text_stripped or "<item" in text_stripped:
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            return [], 0, "unparsable XML body"
+        items = root.findall(".//item")
+        for item in items:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pub_el = item.find("pubDate")
+            title = title_el.text if title_el is not None else ""
+            torrent_url = link_el.text if link_el is not None else ""
+            pub_date_ts = 0
+            if pub_el is not None and pub_el.text:
+                try:
+                    pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
+                except Exception:
+                    pub_date_ts = 0
+            seeders = 0
+            for child in item:
+                if child.tag.endswith("seeders"):
+                    seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
+                    break
+            raw_items.append({
+                "title": title,
+                "torrent": torrent_url,
+                "seeders": seeders,
+                "pub_date": pub_date_ts
+            })
+    else:
+        body_head = text_stripped[:50].replace("\n", " ")
+        return [], 0, f"unexpected body: {body_head!r}"
+
+    if not raw_items:
+        return [], 0, ""
+
+    results = []
+    for item in raw_items:
+        t = item["title"]
+        torrent_url = item["torrent"]
+        seeders = item["seeders"]
+        pub_date = item.get("pub_date", 0)
+        if not t or not torrent_url:
+            continue
+
+        if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
+            results.append({
+                "title": t,
+                "magnet": torrent_url,
+                "seeders": seeders,
+                "pub_date": pub_date
+            })
+
+    return results, len(raw_items), ""
+
 async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> tuple:
+    """Returns (results, diagnostic_note). Tries direct Nyaa RSS first (<1s), then healthy GAS proxies if blocked."""
     encoded_query = urllib.parse.quote(query)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     tag = query[:40].replace("\n", " ")
-    proxies = get_ordered_proxies()
+
+    # 1. Fast Path: Direct Nyaa RSS attempt (sub-second response)
+    direct_url = f"https://nyaa.si/?page=rss&q={encoded_query}"
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=3.5, headers=headers, follow_redirects=True) as client:
+            r = await client.get(direct_url)
+            if r.status_code == 200 and ("<rss" in r.text or "<item" in r.text):
+                results, raw_count, err = _parse_nyaa_rss_body(r.text, r.content, romaji, english, ep, synonyms=synonyms, is_special=is_special)
+                if results:
+                    return results, ""
+                if raw_count == 0:
+                    return [], f"'{tag}' direct raw=0"
+                return [], f"'{tag}' direct raw={raw_count} matched=0"
+    except Exception:
+        # Direct blocked by Cloudflare (403/503), timed out, or connection failed -> fallback to proxies
+        pass
+
+    # 2. Proxy Fallback with health cooldown and fast 6.0s timeout
+    proxies = get_healthy_proxies()
     if not proxies:
-        return [], f"'{tag}' no GAS proxies configured"
+        return [], f"'{tag}' no healthy GAS proxies configured"
+
     last_err = ""
-    transport = httpx.AsyncHTTPTransport(retries=2)
     for proxy_base in proxies:
         url = f"{proxy_base}?q={encoded_query}"
         try:
-            async with httpx.AsyncClient(transport=transport, timeout=20.0, headers=headers, follow_redirects=True) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=6.0, headers=headers, follow_redirects=True) as client:
                 r = await client.get(url)
                 if r.status_code != 200:
+                    mark_proxy_failure(proxy_base)
                     last_err = f"'{tag}' proxy HTTP {r.status_code}"
                     continue
-                raw_items = []
-                text = r.text.strip()
-                if text.startswith("{"):
-                    try:
-                        data = r.json()
-                    except Exception:
-                        last_err = f"'{tag}' invalid JSON body"
-                        continue
-                    payload = data.get("data")
-                    if not isinstance(payload, list):
-                        last_err = f"'{tag}' proxy error payload ({data.get('error') or data.get('status')})"
-                        continue
-                    for item in payload:
-                        raw_items.append({
-                            "title": item.get("title", ""),
-                            "torrent": item.get("torrent", ""),
-                            "seeders": int(item.get("seeders") or 0),
-                            "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
-                        })
-                elif "<rss" in text or "<item" in text:
-                    try:
-                        root = ET.fromstring(r.content)
-                    except ET.ParseError:
-                        last_err = f"'{tag}' unparsable XML body"
-                        continue
-                    items = root.findall(".//item")
-                    for item in items:
-                        title_el = item.find("title")
-                        link_el = item.find("link")
-                        pub_el = item.find("pubDate")
-                        title = title_el.text if title_el is not None else ""
-                        torrent_url = link_el.text if link_el is not None else ""
-                        pub_date_ts = 0
-                        if pub_el is not None and pub_el.text:
-                            try:
-                                pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
-                            except Exception:
-                                pub_date_ts = 0
-                        seeders = 0
-                        for child in item:
-                            if child.tag.endswith("seeders"):
-                                seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
-                                break
-                        raw_items.append({
-                            "title": title,
-                            "torrent": torrent_url,
-                            "seeders": seeders,
-                            "pub_date": pub_date_ts
-                        })
-                else:
-                    body_head = text.strip()[:50].replace("\n", " ")
-                    last_err = f"'{tag}' unexpected body: {body_head!r}"
+
+                results, raw_count, err = _parse_nyaa_rss_body(r.text, r.content, romaji, english, ep, synonyms=synonyms, is_special=is_special)
+                if err:
+                    mark_proxy_failure(proxy_base)
+                    last_err = f"'{tag}' {err}"
                     continue
-                if not raw_items:
-                    return [], f"'{tag}' raw=0"
-                results = []
-                for item in raw_items:
-                    t = item["title"]
-                    torrent_url = item["torrent"]
-                    seeders = item["seeders"]
-                    pub_date = item.get("pub_date", 0)
-                    if not t or not torrent_url:
-                        continue
-                    if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                        results.append({
-                            "title": t,
-                            "magnet": torrent_url,
-                            "seeders": seeders,
-                            "pub_date": pub_date
-                        })
+
+                mark_proxy_success(proxy_base)
                 if results:
                     return results, ""
-                return [], f"'{tag}' raw={len(raw_items)} matched=0"
+                if raw_count == 0:
+                    return [], f"'{tag}' raw=0"
+                return [], f"'{tag}' raw={raw_count} matched=0"
         except Exception as e:
+            mark_proxy_failure(proxy_base)
             last_err = f"'{tag}' {type(e).__name__}"
             continue
+
     return [], last_err or f"'{tag}' all proxies failed"
 
 # ─── aria2c Downloader ─────────────────────────────────────────
@@ -1451,6 +1511,171 @@ def delete_from_pixeldrain(file_id: str) -> bool:
     except Exception:
         return False
 
+# ─── Telegram Backup Uploader ──────────────────────────────────
+def is_telegram_configured() -> bool:
+    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
+
+async def upload_to_telegram(file_path: str, filename: str = None, caption: str = "") -> dict:
+    if not is_telegram_configured():
+        log_message("Telegram backup: credentials not configured, skipping.")
+        return None
+
+    if not os.path.exists(file_path):
+        log_message(f"Telegram backup: file not found at {file_path}")
+        return None
+
+    target_name = filename or os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+
+    # Telegram MTProto limit for bot uploads is 2GB
+    if file_size > 2000 * 1024 * 1024:
+        log_message(f"Telegram backup skipped: file size ({round(file_size / 1048576, 2)} MB) exceeds 2GB limit.")
+        return None
+
+    try:
+        import pyrogram.utils
+        pyrogram.utils.MIN_CHANNEL_ID = -10099999999999
+        from pyrogram import Client
+
+        log_message(f"Telegram backup: uploading {target_name} ({round(file_size / 1048576, 2)} MB)...")
+
+        async with Client(
+            "telegram_backup_session",
+            api_id=TELEGRAM_API_ID,
+            api_hash=TELEGRAM_API_HASH,
+            bot_token=TELEGRAM_BOT_TOKEN,
+            in_memory=True
+        ) as app:
+            is_video = target_name.lower().endswith((".mp4", ".mkv", ".webm", ".avi", ".mov"))
+            if is_video:
+                msg = await app.send_video(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    video=file_path,
+                    caption=caption or target_name,
+                    file_name=target_name,
+                    supports_streaming=True
+                )
+                media = msg.video or msg.document or msg.animation
+            else:
+                msg = await app.send_document(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    document=file_path,
+                    caption=caption or target_name,
+                    file_name=target_name
+                )
+                media = msg.document
+
+            media_file_id = getattr(media, "file_id", "")
+            log_message(f"Telegram backup: successfully uploaded (message_id={msg.id})")
+            return {
+                "message_id": msg.id,
+                "channel_id": TELEGRAM_CHANNEL_ID,
+                "file_size": file_size,
+                "file_name": target_name,
+                "file_id": media_file_id,
+            }
+    except Exception as e:
+        log_message(f"Telegram backup failed for {target_name}: {e}")
+        return None
+
+_mal_id_cache = {}
+
+async def get_mal_id(anime_id: int = None, anilist_id: int = None) -> int:
+    """Returns mal_id for an anime. If missing in DB, queries AniList, caches and stores in anime.mal_id in Turso."""
+    if anilist_id and anilist_id in _mal_id_cache:
+        return _mal_id_cache[anilist_id]
+
+    # 1. Check local DB
+    if anilist_id:
+        try:
+            rows = await execute_sql("SELECT mal_id FROM anime WHERE anilist_id = ? AND mal_id IS NOT NULL AND mal_id > 0 LIMIT 1", [anilist_id])
+            if rows and rows[0].get("mal_id"):
+                val = int(rows[0]["mal_id"])
+                _mal_id_cache[anilist_id] = val
+                return val
+        except Exception:
+            pass
+    if anime_id:
+        try:
+            rows = await execute_sql("SELECT anilist_id, mal_id FROM anime WHERE id = ? LIMIT 1", [anime_id])
+            if rows:
+                if rows[0].get("mal_id"):
+                    val = int(rows[0]["mal_id"])
+                    if rows[0].get("anilist_id"):
+                        _mal_id_cache[rows[0]["anilist_id"]] = val
+                    return val
+                if not anilist_id:
+                    anilist_id = rows[0].get("anilist_id")
+        except Exception:
+            pass
+
+    # 2. Fetch from AniList if not in DB
+    if anilist_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post("https://graphql.anilist.co", json={
+                    "query": "query($id: Int) { Media(id: $id, type: ANIME) { idMal } }",
+                    "variables": {"id": anilist_id}
+                })
+                if r.status_code == 200:
+                    id_mal = r.json().get("data", {}).get("Media", {}).get("idMal")
+                    if id_mal:
+                        val = int(id_mal)
+                        _mal_id_cache[anilist_id] = val
+                        try:
+                            await execute_sql("UPDATE anime SET mal_id = ? WHERE anilist_id = ?", [val, anilist_id])
+                            log_message(f"Populated missing mal_id={val} for AniList ID {anilist_id} in anime table.")
+                        except Exception:
+                            pass
+                        return val
+        except Exception as e:
+            log_message(f"Failed to fetch idMal from AniList for {anilist_id}: {e}")
+
+    return None
+
+def detect_quality(filename: str) -> str:
+    if not filename:
+        return "1080p"
+    fn = filename.lower()
+    if "2160" in fn or "4k" in fn:
+        return "2160p"
+    if "1080" in fn:
+        return "1080p"
+    if "720" in fn:
+        return "720p"
+    if "480" in fn:
+        return "480p"
+    return "1080p"
+
+def build_telegram_metadata(
+    anilist_id: int,
+    id_mal: int,
+    ep_id: int,
+    ep_num: int,
+    filename: str,
+    subs_found: str = "",
+    audio_found: str = "",
+    duration: int = 0,
+    size_mb: float = 0.0,
+    pixeldrain_id: str = ""
+) -> tuple:
+    quality = detect_quality(filename)
+    safe_name = f"AL{anilist_id or 0}_EP{ep_num}_{quality}.mkv"
+    meta = {
+        "id_anilist": anilist_id,
+        "id_mal": id_mal,
+        "episode_id": ep_id,
+        "episode_number": ep_num,
+        "quality": quality,
+        "subtitles": [s.strip() for s in subs_found.split(",") if s.strip()] if subs_found else [],
+        "audio_tracks": [a.strip() for a in audio_found.split(",") if a.strip()] if audio_found else [],
+        "duration": int(duration or 0),
+        "file_size_mb": float(size_mb or 0.0),
+        "pixeldrain_id": pixeldrain_id or ""
+    }
+    caption = json.dumps(meta, indent=2, ensure_ascii=False)
+    return safe_name, caption
+
 # ═══════════════════════════════════════════════════════════════
 #  Content Analysis Pipeline
 # ═══════════════════════════════════════════════════════════════
@@ -1459,6 +1684,7 @@ ANILIST_MEDIA_QUERY = """
 query ($id: Int) {
   Media(id: $id, type: ANIME) {
     id
+    idMal
     title { romaji english native }
     synonyms
     format
@@ -1493,7 +1719,7 @@ async def fetch_anime_by_id(anilist_id: int) -> dict:
 
     # Fallback to local DB if AniList API is disabled or unreachable
     db_rows = await execute_sql("""
-        SELECT id, title_romaji, title_english, title_native, synonyms,
+        SELECT id, anilist_id, mal_id, title_romaji, title_english, title_native, synonyms,
                cover_url, banner_url, synopsis, genres, format, status
         FROM anime WHERE anilist_id = ?
     """, [anilist_id])
@@ -1504,6 +1730,7 @@ async def fetch_anime_by_id(anilist_id: int) -> dict:
         log_message(f"ℹ️ AniList API is offline; loaded '{row.get('title_romaji')}' from local database.")
         return {
             "id": anilist_id,
+            "idMal": row.get("mal_id"),
             "title": {
                 "romaji": row.get("title_romaji") or "",
                 "english": row.get("title_english") or "",
@@ -1615,8 +1842,8 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
 
     all_results = []
     search_notes = []
-    for i in range(0, min(len(queries), 6), 2):
-        batch = queries[i:i+2]
+    for i in range(0, min(len(queries), 12), 4):
+        batch = queries[i:i+4]
         tasks = [
             search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
             for q in batch
@@ -1657,7 +1884,7 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
     def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
         if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
             return True
-        if t_pub_date < (ep_aired_at - 7 * 86400):
+        if t_pub_date < (ep_aired_at - 15 * 86400):
             return False
         return True
 
@@ -1886,6 +2113,24 @@ async def process_single_episode(anime_info: dict, ep_num: int, anime_db_id: int
                   subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
                   int(time.time()), ep_id])
 
+            # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+            id_mal = await get_mal_id(anime_id=anime_db_id, anilist_id=anilist_id)
+            safe_name, tg_caption = build_telegram_metadata(
+                anilist_id=anilist_id,
+                id_mal=id_mal,
+                ep_id=ep_id,
+                ep_num=ep_num,
+                filename=v_name,
+                subs_found=subs_found,
+                audio_found=audio_found,
+                duration=duration_found,
+                size_mb=size_mb,
+                pixeldrain_id=pd_id
+            )
+            tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+            if tg_data:
+                await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
+
             # Store parsed erai_title
             parsed_erai = parse_erai_anime_title(v_name)
             if parsed_erai and not erai_title:
@@ -2015,6 +2260,25 @@ async def process_direct_url(anime_info: dict, ep_num: int, anime_db_id: int, ny
         """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score,
               subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
               int(time.time()), ep_id])
+
+        # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+        anilist_id = anime_info.get("id") or 0
+        id_mal = await get_mal_id(anime_id=anime_db_id, anilist_id=anilist_id)
+        safe_name, tg_caption = build_telegram_metadata(
+            anilist_id=anilist_id,
+            id_mal=id_mal,
+            ep_id=ep_id,
+            ep_num=ep_num,
+            filename=v_name,
+            subs_found=subs_found,
+            audio_found=audio_found,
+            duration=duration_found,
+            size_mb=size_mb,
+            pixeldrain_id=pd_id
+        )
+        tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+        if tg_data:
+            await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
 
         # Store parsed erai_title
         parsed_erai = parse_erai_anime_title(v_name)
@@ -2253,6 +2517,25 @@ async def process_batch_download(anime_info: dict, episodes: list, anime_db_id: 
                           subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()),
                           int(time.time()), ep_id])
 
+                    # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+                    anilist_id = anime_info.get("id") or 0
+                    id_mal = await get_mal_id(anime_id=anime_db_id, anilist_id=anilist_id)
+                    safe_name, tg_caption = build_telegram_metadata(
+                        anilist_id=anilist_id,
+                        id_mal=id_mal,
+                        ep_id=ep_id,
+                        ep_num=ep_num,
+                        filename=fname,
+                        subs_found=subs_found,
+                        audio_found=audio_found,
+                        duration=duration_found,
+                        size_mb=size_mb,
+                        pixeldrain_id=pd_id
+                    )
+                    tg_data = await upload_to_telegram(fp, filename=safe_name, caption=tg_caption)
+                    if tg_data:
+                        await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
+
                     # Store parsed erai_title
                     parsed_erai = parse_erai_anime_title(fname)
                     if parsed_erai and not erai_title:
@@ -2296,17 +2579,33 @@ async def ensure_database_schema():
             "audio_tracks_1080": "TEXT",
             "pixeldrain_1080_url": "TEXT",
             "pixeldrain_1080_id": "TEXT",
+            "subtitles_2160": "TEXT",
+            "audio_tracks_2160": "TEXT",
+            "pixeldrain_2160_url": "TEXT",
+            "pixeldrain_2160_id": "TEXT",
+            "backup_2160_url": "TEXT",
+            "backup_2160_id": "TEXT",
+            "mirror_2160_source": "TEXT",
+            "mirror_2160_missing": "INTEGER NOT NULL DEFAULT 0",
             "mirror_720_missing": "INTEGER NOT NULL DEFAULT 0",
             "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
             "mirror_updated_at": "INTEGER",
             "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
             "audio_upgrade_failed": "INTEGER NOT NULL DEFAULT 0",
             "skip_times": "TEXT",
+            "telegram_file_id": "TEXT",
+            "telegram_message_id": "INTEGER",
         }
         for name, col_type in columns.items():
             if name not in existing:
                 await execute_sql(f"ALTER TABLE episodes ADD COLUMN {name} {col_type}")
                 log_message(f"Added column '{name}' to episodes table.")
+
+        anime_cols = await execute_sql("PRAGMA table_info(anime)")
+        anime_existing = {row["name"] for row in anime_cols or [] if isinstance(row, dict) and "name" in row}
+        if "mal_id" not in anime_existing:
+            await execute_sql("ALTER TABLE anime ADD COLUMN mal_id INTEGER")
+            log_message("Added column 'mal_id' to anime table.")
     except Exception as e:
         log_message(f"Schema maintenance notice: {e}")
 
@@ -2372,26 +2671,33 @@ async def run_pipeline(anilist_id_str: str, episodes_str: str, force: bool, nyaa
     synopsis = anime_info.get("description") or ""
     genres = json.dumps(anime_info.get("genres") or [])
 
+    id_mal = anime_info.get("idMal")
+    if not id_mal:
+        id_mal = await get_mal_id(anilist_id=anilist_id)
+
     log_message(f"✅ Anime: {romaji}")
     if english:
         log_message(f"   English: {english}")
+    if id_mal:
+        log_message(f"   MyAnimeList ID: {id_mal}")
     log_message(f"   Format: {format_type} | Status: {anime_info.get('status')}")
     log_message("")
 
     # Ensure anime exists in DB
     await execute_sql("""
         INSERT INTO anime (anilist_id, title_romaji, title_english, title_native, synonyms,
-                           cover_url, banner_url, synopsis, genres, format, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           cover_url, banner_url, synopsis, genres, format, status, mal_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(anilist_id) DO UPDATE SET
             title_romaji = excluded.title_romaji,
             title_english = excluded.title_english,
             synonyms = excluded.synonyms,
             cover_url = CASE WHEN anime.cover_url IS NULL OR anime.cover_url = '' THEN excluded.cover_url ELSE anime.cover_url END,
+            mal_id = CASE WHEN anime.mal_id IS NULL OR anime.mal_id = 0 THEN excluded.mal_id ELSE anime.mal_id END,
             status = excluded.status
     """, [anilist_id, romaji, english, anime_info["title"].get("native") or "",
           json.dumps(synonyms), cover_url, banner_url, synopsis, genres, format_type,
-          anime_info.get("status") or "RELEASING"])
+          anime_info.get("status") or "RELEASING", id_mal])
 
     # Get anime DB ID
     db_row = await execute_sql("SELECT id FROM anime WHERE anilist_id = ?", [anilist_id])
