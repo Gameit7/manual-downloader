@@ -17,7 +17,7 @@ on:
         type: boolean
         default: false
       nyaa_url:
-        description: 'Direct source URL (optional — skips search)'
+        description: 'Direct source URL(s) comma-separated (optional — e.g. url1,url2 or batch URL)'
         required: false
         type: string
 
@@ -36,9 +36,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends aria2 ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2 ffmpeg
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -56,4 +57,8 @@ jobs:
           GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 }}
           GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 }}
           GAS_PROXY_URL_4: ${{ secrets.GAS_PROXY_URL_4 }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
         run: python app.py
